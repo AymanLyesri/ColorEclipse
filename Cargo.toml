@@ -1,0 +1,12 @@
+[package]
+name = "coloreclipse"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "coloreclipse"
+path = "src/main.rs"
+
+# No dependencies on purpose: everything is gsettings/cwal/magick/ffmpeg/hyprctl
+# driven, so the binary needs nothing but the toolchain to build.
+[dependencies]
