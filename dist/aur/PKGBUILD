@@ -2,13 +2,14 @@
 pkgname=coloreclipse-git
 pkgver=0.1.0
 pkgrel=1
-pkgdesc="Theme variant and GTK/icon/cursor applier plus cwal color generation for ArchEclipse"
+pkgdesc="Theme variant and GTK/icon/cursor applier with cwal colors for ArchEclipse"
 arch=('x86_64')
 url="https://github.com/AymanLyesri/ColorEclipse"
 license=('GPL-3.0-only')
-depends=('glib2' 'libnotify' 'cwal' 'hyprland' 'psmisc' 'imagemagick')
+depends=('glib2' 'libnotify' 'cwal-git' 'imagemagick' 'psmisc')
 makedepends=('git' 'rust')
-optdepends=('ffmpeg: frame extraction for animated (video/gif) wallpapers'
+optdepends=('hyprland: apply the cursor theme via hyprctl'
+            'ffmpeg: frame extraction for animated (video/gif) wallpapers'
             'whitesur-gtk-theme: GTK themes the applier selects'
             'whitesur-icon-theme: icon themes the applier selects'
             'phinger-cursors: cursor themes the applier selects')
@@ -41,4 +42,5 @@ check() {
 package() {
   cd ColorEclipse
   install -Dm755 target/release/coloreclipse "$pkgdir/usr/bin/coloreclipse"
+  install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
 }

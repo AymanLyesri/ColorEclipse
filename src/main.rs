@@ -40,8 +40,17 @@ fn theme_conf() -> PathBuf {
     config_dir().join("coloreclipse/theme.conf")
 }
 
+/// WallEclipse's config dir: `$WALLECLIPSE_CONFIG_DIR`, else
+/// `~/.config/walleclipse/config` (same lookup as WallEclipse itself).
+fn walleclipse_config_dir() -> PathBuf {
+    match env::var("WALLECLIPSE_CONFIG_DIR") {
+        Ok(dir) if !dir.is_empty() => PathBuf::from(dir),
+        _ => home().join(".config/walleclipse/config"),
+    }
+}
+
 fn current_wallpaper_conf() -> PathBuf {
-    home().join(".config/walleclipse/config/current.conf")
+    walleclipse_config_dir().join("current.conf")
 }
 
 fn thumb_cache() -> PathBuf {
@@ -160,6 +169,7 @@ fn apply_icon(variant: &str) -> bool {
 /// Every component runs in parallel; a failing one never aborts the others.
 fn apply_components() {
     let variant = current_variant();
+    let mut switched = None;
     thread::scope(|scope| {
         scope.spawn(|| apply_cursor(variant));
         scope.spawn(|| {
@@ -168,12 +178,24 @@ fn apply_components() {
         scope.spawn(|| {
             let _ = apply_icon(variant);
         });
-        scope.spawn(|| {
-            if let Err(message) = run_wal(None) {
-                eprintln!("{message}");
+        let wal = scope.spawn(|| run_wal(None));
+        match wal.join() {
+            Ok(Ok(target)) => {
+                if target != variant {
+                    switched = Some(target);
+                }
             }
-        });
+            Ok(Err(message)) => eprintln!("{message}"),
+            Err(_) => {}
+        }
     });
+    // wal may have auto-switched the variant while the sibling threads raced it
+    // with the old one; re-assert the resolved variant so the theme is consistent.
+    if let Some(target) = switched {
+        apply_cursor(target);
+        let _ = apply_gtk(target);
+        let _ = apply_icon(target);
+    }
     println!("All theme components applied successfully");
 }
 
@@ -254,13 +276,20 @@ fn extract_frame(video: &str, cached: &Path) -> Result<(), String> {
 }
 
 fn expand_home(path: &str) -> String {
-    path.replace("$HOME", &home().to_string_lossy())
+    let home = home();
+    let home = home.to_string_lossy();
+    if let Some(rest) = path.strip_prefix('~') {
+        return format!("{home}{rest}");
+    }
+    path.replace("$HOME", &home)
 }
 
-fn run_wal(wallpaper_arg: Option<&str>) -> Result<(), String> {
+/// Returns the variant in effect after the run (the auto-detected one when it
+/// switched), so callers can re-assert a consistent theme.
+fn run_wal(wallpaper_arg: Option<&str>) -> Result<&'static str, String> {
     if !autocolor() {
         println!("Auto color generation disabled in {} (autocolor=false)", theme_conf().display());
-        return Ok(());
+        return Ok(current_variant());
     }
     let variant = current_variant();
 
@@ -312,7 +341,7 @@ fn run_wal(wallpaper_arg: Option<&str>) -> Result<(), String> {
         let _ = apply_gtk(target);
         let _ = apply_icon(target);
     }
-    Ok(())
+    Ok(target)
 }
 
 fn switch_theme(target: Option<&str>) -> i32 {
@@ -372,7 +401,7 @@ fn main() {
             0
         }
         Some("wal") => match run_wal(args.get(1).map(String::as_str)) {
-            Ok(()) => 0,
+            Ok(_) => 0,
             Err(message) => {
                 eprintln!("{message}");
                 1
@@ -416,5 +445,20 @@ mod tests {
         assert!(!is_animated("a/b/wall.png"));
         assert_eq!(thumb_hash("x"), thumb_hash("x"));
         assert_ne!(thumb_hash("x"), thumb_hash("y"));
+    }
+
+    #[test]
+    fn home_expansion() {
+        let home = home().to_string_lossy().into_owned();
+        assert_eq!(expand_home("$HOME/x.jpg"), format!("{home}/x.jpg"));
+        assert_eq!(expand_home("~/x.jpg"), format!("{home}/x.jpg"));
+        assert_eq!(expand_home("/abs/x.jpg"), "/abs/x.jpg");
+    }
+
+    #[test]
+    fn walleclipse_conf_dir_env_override() {
+        env::set_var("WALLECLIPSE_CONFIG_DIR", "/tmp/wc-test");
+        assert_eq!(current_wallpaper_conf(), PathBuf::from("/tmp/wc-test/current.conf"));
+        env::remove_var("WALLECLIPSE_CONFIG_DIR");
     }
 }
