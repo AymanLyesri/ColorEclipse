@@ -52,11 +52,83 @@ mod tests {
         assert_eq!(variant_for_pixels(&[s.background]), "light");
         assert_eq!(variant_for_pixels(&[s.foreground]), "dark");
     }
+
+    fn write_rgba_png(name: &str, width: u32, height: u32, fill: impl Fn(u32, u32) -> [u8; 4]) -> PathBuf {
+        let mut image = image::RgbaImage::new(width, height);
+        for (x, y, pixel) in image.enumerate_pixels_mut() {
+            *pixel = image::Rgba(fill(x, y));
+        }
+        let path = std::env::temp_dir().join(format!(
+            "coloreclipse-{name}-{}-tmp.png",
+            std::process::id()
+        ));
+        image.save(&path).unwrap();
+        path
+    }
+
+    #[test]
+    fn fully_transparent_image_is_an_error() {
+        let path = write_rgba_png("alpha-empty", 8, 8, |_, _| [0, 0, 0, 0]);
+        let result = generate(&path, "wall.png", "dark");
+        let _ = std::fs::remove_file(&path);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn transparent_regions_do_not_drag_palette_to_black() {
+        // Red disc on a transparent field: only opaque pixels may vote.
+        let path = write_rgba_png("alpha-disc", 64, 64, |x, y| {
+            let (dx, dy) = (x as i32 - 32, y as i32 - 32);
+            if dx * dx + dy * dy < 24 * 24 {
+                [255, 0, 0, 255]
+            } else {
+                [0, 0, 0, 0]
+            }
+        });
+        let s = generate(&path, "wall.png", "dark").unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert_ne!(s.background, Rgb(0, 0, 0));
+    }
+
+    #[test]
+    fn corrupt_bytes_are_an_error() {
+        let path = std::env::temp_dir().join(format!("coloreclipse-corrupt-{}", std::process::id()));
+        std::fs::write(&path, b"this is not an image").unwrap();
+        let result = generate(&path, "wall.png", "dark");
+        let _ = std::fs::remove_file(&path);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn solid_pixel_yields_usable_scheme() {
+        let path = write_rgba_png("solid", 1, 1, |_, _| [255, 0, 0, 255]);
+        let s = generate(&path, "wall.png", "dark").unwrap();
+        let _ = std::fs::remove_file(&path);
+        let unique: std::collections::HashSet<_> = s.colors.iter().collect();
+        assert!(unique.len() >= 8);
+    }
+
+    #[test]
+    fn wallpaper_path_is_carried_verbatim() {
+        let path = fixture("dark-anime.jpg");
+        let s = generate(&path, "/tmp/some dir/wäll.jpg", "dark").unwrap();
+        assert_eq!(s.wallpaper, "/tmp/some dir/wäll.jpg");
+    }
+
+    #[test]
+    fn light_image_pinned_dark_stays_readable() {
+        let path = fixture("light-scenic.jpg");
+        let wallpaper = path.to_string_lossy().into_owned();
+        let s = generate(&path, &wallpaper, "dark").unwrap();
+        assert!(luminance(&s.background) <= 64);
+        assert!(luminance(&s.foreground) >= 190);
+    }
 }
 
 /// Decode an image to RGB pixels, thumbnailing the longest edge to ~256px so
-/// later quantization stays cheap. Transparent pixels are composited over
-/// black. Errors are strings for the CLI to print.
+/// later quantization stays cheap. Fully transparent pixels are skipped;
+/// semi-transparent ones are composited over black. Errors are strings for
+/// the CLI to print.
 pub fn decode_pixels(path: &std::path::Path) -> Result<Vec<Rgb>, String> {
     let image = image::ImageReader::open(path)
         .map_err(|e| e.to_string())?
@@ -78,6 +150,9 @@ pub fn decode_pixels(path: &std::path::Path) -> Result<Vec<Rgb>, String> {
     let rgba = thumbnail.to_rgba8();
     Ok(rgba
         .pixels()
+        // Fully transparent pixels carry no color information; letting them
+        // vote would drag palettes of transparent PNGs toward black.
+        .filter(|pixel| pixel[3] != 0)
         .map(|pixel| {
             let alpha = f32::from(pixel[3]) / 255.0;
             Rgb(
