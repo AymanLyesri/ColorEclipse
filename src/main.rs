@@ -217,37 +217,15 @@ fn is_newer(candidate: &Path, reference: &Path) -> bool {
     }
 }
 
-/// Perceived brightness split: >128 is light. Also used for magick's average color.
-fn variant_from_rgb(r: u32, g: u32, b: u32) -> &'static str {
-    if (r * 299 + g * 587 + b * 114) / 1000 > 128 { "light" } else { "dark" }
-}
-
-/// Variant from a wallpaper's average color; `dark` whenever ImageMagick cannot answer.
+/// Variant from a wallpaper's average color; `dark` whenever the image cannot
+/// be decoded (same fallback as the old ImageMagick probe).
 fn variant_from_wallpaper(wallpaper: &Path) -> &'static str {
     if !wallpaper.is_file() {
         return "dark";
     }
-    let path_arg = wallpaper.to_string_lossy().into_owned();
-    let Some(rgb) = stdout_of(
-        "magick",
-        &[
-            &path_arg,
-            "-resize",
-            "1x1!",
-            "-format",
-            "%[fx:int(255*r)],%[fx:int(255*g)],%[fx:int(255*b)]",
-            "info:",
-        ],
-    ) else {
-        return "dark";
-    };
-    let mut channels = rgb.split(',');
-    match (channels.next(), channels.next(), channels.next()) {
-        (Some(r), Some(g), Some(b)) => match (r.trim().parse(), g.trim().parse(), b.trim().parse()) {
-            (Ok(r), Ok(g), Ok(b)) => variant_from_rgb(r, g, b),
-            _ => "dark",
-        },
-        _ => "dark",
+    match palette::decode_pixels(wallpaper) {
+        Ok(pixels) => palette::variant_for_pixels(&pixels),
+        Err(_) => "dark",
     }
 }
 
@@ -441,9 +419,10 @@ mod tests {
 
     #[test]
     fn variant_detection() {
-        assert_eq!(variant_from_rgb(255, 255, 255), "light");
-        assert_eq!(variant_from_rgb(0, 0, 0), "dark");
-        assert_eq!(variant_from_rgb(128, 128, 128), "dark"); // not > 128
+        use crate::palette::{Rgb, variant_for_pixels};
+        assert_eq!(variant_for_pixels(&[Rgb(255, 255, 255)]), "light");
+        assert_eq!(variant_for_pixels(&[Rgb(0, 0, 0)]), "dark");
+        assert_eq!(variant_for_pixels(&[Rgb(128, 128, 128)]), "dark"); // not > 128
         assert!(is_animated("a/b/Video.MP4"));
         assert!(!is_animated("a/b/wall.png"));
         assert_eq!(thumb_hash("x"), thumb_hash("x"));
