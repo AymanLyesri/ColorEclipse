@@ -2,11 +2,11 @@
 pkgname=coloreclipse-git
 pkgver=0.1.0
 pkgrel=1
-pkgdesc="Theme variant and GTK/icon/cursor applier with cwal colors for ArchEclipse"
+pkgdesc="Theme variant and GTK/icon/cursor applier with internal wallpaper colors for ArchEclipse"
 arch=('x86_64')
 url="https://github.com/AymanLyesri/ColorEclipse"
 license=('GPL-3.0-only')
-depends=('glib2' 'libnotify' 'cwal-git' 'imagemagick' 'psmisc')
+depends=('glib2' 'libnotify' 'psmisc')
 makedepends=('git' 'rust')
 optdepends=('hyprland: apply the cursor theme via hyprctl'
             'ffmpeg: frame extraction for animated (video/gif) wallpapers'

@@ -5,7 +5,7 @@ Rust replacement for hypr's former `theme/scripts/*.sh`, shipped as its own
 package so the compositor config no longer compiles anything at login.
 
 It drives the system color-scheme (`gsettings`), the GTK/icon/cursor themes, and
-`cwal` color generation — in parallel, from one binary.
+internal wallpaper color generation — in parallel, from one binary.
 
 ## Why
 
@@ -30,8 +30,8 @@ dist/aur/PKGBUILD       coloreclipse-git (AUR)
 | `coloreclipse get` | print the current variant (`dark`\|`light`) |
 | `coloreclipse switch` | toggle the variant, then re-apply everything |
 | `coloreclipse switch dark\|light` | set the variant, then re-apply everything |
-| `coloreclipse apply` | re-apply cursor/GTK/icon/cwal for the current variant |
-| `coloreclipse wal [wallpaper]` | regenerate `cwal` colors (defaults to walleclipse's current wallpaper) |
+| `coloreclipse apply` | re-apply cursor/GTK/icon/colors for the current variant |
+| `coloreclipse wal [wallpaper]` | regenerate internal colors (defaults to walleclipse's current wallpaper) |
 
 `switch` refuses to run while `autovariant` is enabled, and `wal` (auto-)picks
 light/dark from the wallpaper's average brightness when it is — the same
@@ -52,9 +52,12 @@ Settings toggle writes this file; deleting it resets to auto.
 ## Runtime dependencies
 
 Used as found, each degrading gracefully when absent: `gsettings` (glib2),
-`cwal`, `hyprctl` (hyprland), `magick` (imagemagick, variant detection),
-`killall` (psmisc), `notify-send` (libnotify), and `ffmpeg` for the animated
-wallpaper frame extraction (cached in `~/.cache/wall-thumbs`). The GTK/icon/
+`hyprctl` (hyprland), `killall` (psmisc), `notify-send` (libnotify), and `ffmpeg` for the animated
+wallpaper frame extraction (cached in `~/.cache/wall-thumbs`). Colors are generated
+internally (k-means over a thumbnail via the `image` crate) into the pywal-style
+file set in `~/.cache/coloreclipse` (`colors.sh`, `colors.scss`, `colors.json`,
+`sequences`, … — 55 templates plus `sequences`); there is no `~/.cache/cwal`
+shim, so point consumers at the new dir. The GTK/icon/
 cursor names it sets come from `whitesur-gtk-theme`, `whitesur-icon-theme` and
 `phinger-cursors`.
 

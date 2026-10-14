@@ -3,7 +3,7 @@
 //!   coloreclipse get                  print the current variant (`dark`|`light`)
 //!   coloreclipse switch [dark|light]   set the variant (toggles when omitted), then re-apply
 //!   coloreclipse apply                 re-apply every component for the current variant
-//!   coloreclipse wal [wallpaper]       regenerate cwal colors (defaults to the current wallpaper)
+//!   coloreclipse wal [wallpaper]       regenerate wallpaper colors (defaults to the current wallpaper)
 //!
 //! Flags live in `$XDG_CONFIG_HOME/coloreclipse/theme.conf` (`autocolor=`, `autovariant=`).
 
@@ -58,6 +58,11 @@ fn current_wallpaper_conf() -> PathBuf {
 
 fn thumb_cache() -> PathBuf {
     cache_dir().join("wall-thumbs")
+}
+
+/// Canonical color output dir (cwal's `~/.cache/cwal` is gone; no shim).
+fn wal_out_dir() -> PathBuf {
+    cache_dir().join("coloreclipse")
 }
 
 /// Read a boolean flag from a theme.conf: `autocolor=false`, comments and spaces
@@ -240,7 +245,7 @@ fn thumb_hash(input: &str) -> String {
     format!("{hash:016x}")
 }
 
-/// Extract one frame (ffmpeg) so cwal has a still image to color from.
+/// Extract one frame (ffmpeg) so generation has a still image to color from.
 fn extract_frame(video: &str, cached: &Path) -> Result<(), String> {
     if !run("ffmpeg", &["-version"]) {
         return Err("Error: ffmpeg is required to extract a frame from animated wallpapers".to_string());
@@ -308,10 +313,13 @@ fn run_wal(wallpaper_arg: Option<&str>) -> Result<&'static str, String> {
         variant
     };
 
-    run("killall", &["-q", "cwal"]);
-    if !run("cwal", &["-i", &wallpaper, "--mode", target]) {
-        return Err("Error: Failed to generate color scheme".to_string());
-    }
+    // Internal generation: same pywal-style files cwal wrote, now in
+    // ~/.cache/coloreclipse. Bodies render in memory first, so a failure
+    // keeps the last good cache instead of truncating it.
+    let scheme = palette::generate(Path::new(&wallpaper), &wallpaper, target)
+        .map_err(|_| "Error: Failed to generate color scheme".to_string())?;
+    render::write_all(&scheme, &wal_out_dir())
+        .map_err(|_| "Error: Failed to generate color scheme".to_string())?;
     println!("Color scheme generated for {target} theme");
 
     // Apply the auto-switched variant without recursing back into wal.
@@ -442,5 +450,10 @@ mod tests {
         env::set_var("WALLECLIPSE_CONFIG_DIR", "/tmp/wc-test");
         assert_eq!(current_wallpaper_conf(), PathBuf::from("/tmp/wc-test/current.conf"));
         env::remove_var("WALLECLIPSE_CONFIG_DIR");
+    }
+
+    #[test]
+    fn out_dir_is_coloreclipse() {
+        assert_eq!(wal_out_dir(), cache_dir().join("coloreclipse"));
     }
 }

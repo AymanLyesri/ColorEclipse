@@ -7,7 +7,7 @@ edition = "2021"
 name = "coloreclipse"
 path = "src/main.rs"
 
-# No dependencies on purpose: everything is gsettings/cwal/magick/ffmpeg/hyprctl
-# driven, so the binary needs nothing but the toolchain to build.
+# Color generation is internal (image crate); only runtime tools are
+# gsettings/notify-send/hyprctl/ffmpeg, so the binary needs the toolchain to build.
 [dependencies]
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif", "webp", "bmp"] }
