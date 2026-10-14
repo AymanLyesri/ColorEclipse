@@ -14,6 +14,9 @@ use std::process::Command;
 use std::thread;
 use std::time::Duration;
 
+mod palette;
+mod render;
+
 const DEFAULT_FLAG: bool = true; // theme.conf default for autocolor/autovariant
 const CURSOR_SIZE: &str = "24";
 const ANIMATED_EXTS: [&str; 10] = [
