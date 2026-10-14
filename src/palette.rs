@@ -123,6 +123,72 @@ mod tests {
         assert!(luminance(&s.background) <= 64);
         assert!(luminance(&s.foreground) >= 190);
     }
+
+    fn hex_color(hex: &str) -> Rgb {
+        Rgb(
+            u8::from_str_radix(&hex[0..2], 16).unwrap(),
+            u8::from_str_radix(&hex[2..4], 16).unwrap(),
+            u8::from_str_radix(&hex[4..6], 16).unwrap(),
+        )
+    }
+
+    /// Parity with cwal's own output on the same fixtures (recorded 2026-10-14
+    /// via `cwal -i <fixture>`). The derivation structure is byte-faithful
+    /// (background crush, foreground/grey derivations, boosts), so those
+    /// relations hold exactly; clustering differs (Lab k-means vs ImageMagick
+    /// octree), so absolute colors are bounded, not exact.
+    #[test]
+    fn matches_cwal_on_fixtures() {
+        let dark_expected = [
+            "1d1a1b", "645e79", "907064", "b89770", "a7715a", "cfaea1", "e8af79", "a99e9e",
+            "836976", "7665bb", "c9856c", "e1b47b", "da8867", "ebbba8", "ffc388", "d1d1d1",
+        ];
+        let path = fixture("dark-anime.jpg");
+        let wallpaper = path.to_string_lossy().into_owned();
+        let dark = generate(&path, &wallpaper, "dark").unwrap();
+        // Exact derivation relations.
+        assert_eq!(dark.colors[15], lighten(&dark.background, 0.80));
+        assert_eq!(dark.colors[7], saturate(&lighten(&dark.background, 0.60), 0.05));
+        assert_eq!(dark.colors[8], saturate(&lighten(&dark.background, 0.40), 0.10));
+        assert_eq!(dark.foreground, dark.colors[15]);
+        assert_eq!(dark.cursor, dark.colors[15]);
+        // Absolute neighborhood: background in cwal's dark-crush family.
+        let bg_dist = channel_dist(&dark.background, &hex_color("1d1a1b"));
+        assert!(bg_dist <= 32, "dark background drifts: {bg_dist}");
+        // Every cwal accent hue is present somewhere in our set.
+        let set_dist = accent_set_distance(&dark.colors, &dark_expected);
+        assert!(set_dist <= 48, "dark accents drift: {set_dist}");
+
+        let light_expected = [
+            "dcdae2", "a3adcc", "5c73ac", "9cabd2", "768cbc", "3b51b8", "5d699a", "53535e",
+            "978ea8", "6c85cb", "2c52b4", "6684d0", "3e6ac5", "1330bb", "3046a1", "161516",
+        ];
+        let path = fixture("light-scenic.jpg");
+        let wallpaper = path.to_string_lossy().into_owned();
+        let light = generate(&path, &wallpaper, "light").unwrap();
+        assert_eq!(light.colors[15], darken(&light.background, 0.90));
+        assert_eq!(light.colors[7], saturate(&darken(&light.background, 0.60), 0.05));
+        assert_eq!(light.colors[8], saturate(&darken(&light.background, 0.30), 0.10));
+        assert_eq!(light.foreground, light.colors[15]);
+        let bg_dist = channel_dist(&light.background, &hex_color("dcdae2"));
+        assert!(bg_dist <= 32, "light background drifts: {bg_dist}");
+        let set_dist = accent_set_distance(&light.colors, &light_expected);
+        assert!(set_dist <= 32, "light accents drift: {set_dist}");
+    }
+
+    fn channel_dist(a: &Rgb, b: &Rgb) -> u8 {
+        a.0.abs_diff(b.0).max(a.1.abs_diff(b.1)).max(a.2.abs_diff(b.2))
+    }
+    /// For each expected color, distance to the nearest color we produced.
+    fn accent_set_distance(a: &[Rgb; 16], b: &[&str]) -> u8 {
+        b.iter()
+            .map(|h| {
+                let y = hex_color(h);
+                a.iter().map(|x| channel_dist(x, &y)).min().unwrap_or(255)
+            })
+            .max()
+            .unwrap_or(0)
+    }
 }
 
 /// Decode an image to RGB pixels, thumbnailing the longest edge to ~256px so
@@ -193,37 +259,50 @@ fn luminance(color: &Rgb) -> u32 {
     (u32::from(color.0) * 299 + u32::from(color.1) * 587 + u32::from(color.2) * 114) / 1000
 }
 
-/// HSV hue angle in degrees; achromatic colors sort as 0 for determinism.
-fn hue_angle(color: &Rgb) -> f32 {
-    let (r, g, b) = (f32::from(color.0), f32::from(color.1), f32::from(color.2));
-    let max = r.max(g).max(b);
-    let min = r.min(g).min(b);
-    let delta = max - min;
-    if delta < 1.0 {
-        return 0.0;
-    }
-    let hue = if max == r {
-        60.0 * (((g - b) / delta) % 6.0)
-    } else if max == g {
-        60.0 * ((b - r) / delta + 2.0)
-    } else {
-        60.0 * ((r - g) / delta + 4.0)
+// --- CIELAB helpers (clustering happens in Lab, like cwal's Lab quantize) ---
+
+/// sRGB byte color to CIELAB (D65). Mirrors the colorspace cwal quantizes in.
+fn srgb_to_lab(color: &Rgb) -> [f32; 3] {
+    let linear = |channel: u8| {
+        let c = f32::from(channel) / 255.0;
+        if c <= 0.04045 { c / 12.92 } else { ((c + 0.055) / 1.055).powf(2.4) }
     };
-    if hue < 0.0 { hue + 360.0 } else { hue }
+    let (r, g, b) = (linear(color.0), linear(color.1), linear(color.2));
+    let (x, y, z) = (
+        (0.4124564 * r + 0.3575761 * g + 0.1804375 * b) / 0.95047,
+        (0.2126729 * r + 0.7151522 * g + 0.0721750 * b) / 1.0,
+        (0.0193339 * r + 0.1191920 * g + 0.9503041 * b) / 1.08883,
+    );
+    let f = |t: f32| {
+        if t > (6.0 / 29.0_f32).powi(3) {
+            t.cbrt()
+        } else {
+            t / (3.0 * (6.0 / 29.0_f32).powi(2)) + 4.0 / 29.0
+        }
+    };
+    let (fx, fy, fz) = (f(x), f(y), f(z));
+    [116.0 * fy - 16.0, 500.0 * (fx - fy), 200.0 * (fy - fz)]
 }
 
-fn distance_sq(a: &Rgb, b: &Rgb) -> u64 {
+fn lab_distance_sq(a: &[f32; 3], b: &[f32; 3]) -> f32 {
+    (a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2) + (a[2] - b[2]).powi(2)
+}
+
+fn rgb_distance_sq(a: &Rgb, b: &Rgb) -> u64 {
     let dr = i32::from(a.0) - i32::from(b.0);
     let dg = i32::from(a.1) - i32::from(b.1);
     let db = i32::from(a.2) - i32::from(b.2);
     (dr * dr + dg * dg + db * db) as u64
 }
 
-/// Deterministic k-means: seeds are the most frequent 5-bit buckets spread by
-/// a minimum RGB distance, then Lloyd iterations over all thumbnail pixels.
-fn kmeans(pixels: &[Rgb], count: usize, iterations: usize) -> Vec<Rgb> {
-    use std::collections::HashMap;
-    let mut buckets: HashMap<u32, (u64, [u64; 3])> = HashMap::new();
+/// Deterministic k-means in Lab space. Seeds are the most frequent 5-bit
+/// buckets spread by RGB distance; assignments use Lab distance; centroids
+/// stay RGB means. Returns `(centroid, pixel count)` per cluster.
+fn kmeans_lab(pixels: &[Rgb], count: usize, iterations: usize) -> Vec<(Rgb, u64)> {
+    use std::collections::BTreeMap;
+    // BTreeMap (not HashMap): bucket order must be deterministic so the same
+    // image always yields the same palette.
+    let mut buckets: BTreeMap<u32, (u64, [u64; 3])> = BTreeMap::new();
     for pixel in pixels {
         let key =
             (u32::from(pixel.0 >> 3) << 10) | (u32::from(pixel.1 >> 3) << 5) | u32::from(pixel.2 >> 3);
@@ -249,7 +328,7 @@ fn kmeans(pixels: &[Rgb], count: usize, iterations: usize) -> Vec<Rgb> {
         if centroids.len() >= count {
             break;
         }
-        if centroids.iter().all(|c| distance_sq(c, color) >= 48 * 48 * 3) {
+        if centroids.iter().all(|c| rgb_distance_sq(c, color) >= 48 * 48 * 3) {
             centroids.push(*color);
         }
     }
@@ -265,15 +344,18 @@ fn kmeans(pixels: &[Rgb], count: usize, iterations: usize) -> Vec<Rgb> {
             base.2.wrapping_sub(pad / 3),
         ));
     }
+    let mut lab_centroids: Vec<[f32; 3]> = centroids.iter().map(srgb_to_lab).collect();
 
+    let mut totals = vec![0u64; count];
     for _ in 0..iterations {
         let mut sums = vec![[0u64; 3]; count];
-        let mut totals = vec![0u64; count];
-        for pixel in pixels {
+        totals.fill(0);
+        let labs: Vec<[f32; 3]> = pixels.iter().map(srgb_to_lab).collect();
+        for (pixel, lab) in pixels.iter().zip(labs.iter()) {
             let mut best = 0;
-            let mut best_dist = u64::MAX;
-            for (index, centroid) in centroids.iter().enumerate() {
-                let dist = distance_sq(pixel, centroid);
+            let mut best_dist = f32::INFINITY;
+            for (index, centroid) in lab_centroids.iter().enumerate() {
+                let dist = lab_distance_sq(lab, centroid);
                 if dist < best_dist {
                     best_dist = dist;
                     best = index;
@@ -296,6 +378,7 @@ fn kmeans(pixels: &[Rgb], count: usize, iterations: usize) -> Vec<Rgb> {
             );
             if next != *centroid {
                 *centroid = next;
+                lab_centroids[index] = srgb_to_lab(&next);
                 moved = true;
             }
         }
@@ -303,41 +386,203 @@ fn kmeans(pixels: &[Rgb], count: usize, iterations: usize) -> Vec<Rgb> {
             break;
         }
     }
-    centroids
-}
-
-/// Pull a color toward its own grey by `amount` (0 keeps hue, 1 is grey).
-fn desaturate(color: &Rgb, amount: f32) -> Rgb {
-    let grey = luminance(color) as f32;
-    let mix = |channel: u8| (f32::from(channel) + (grey - f32::from(channel)) * amount).round() as u8;
-    Rgb(mix(color.0), mix(color.1), mix(color.2))
-}
-
-/// Scale a color so its luminance becomes `target` (keeps hue).
-fn scale_to_luminance(color: &Rgb, target: u32) -> Rgb {
-    let current = luminance(color);
-    if current == 0 || current == target {
-        return *color;
+    // Final sizes for the converged centroids.
+    totals.fill(0);
+    let labs: Vec<[f32; 3]> = pixels.iter().map(srgb_to_lab).collect();
+    for lab in &labs {
+        let mut best = 0;
+        let mut best_dist = f32::INFINITY;
+        for (index, centroid) in lab_centroids.iter().enumerate() {
+            let dist = lab_distance_sq(lab, centroid);
+            if dist < best_dist {
+                best_dist = dist;
+                best = index;
+            }
+        }
+        totals[best] += 1;
     }
-    let factor = target as f32 / current as f32;
+    centroids.into_iter().zip(totals.into_iter()).collect()
+}
+
+// --- cwal-faithful color derivation (HSL/HSV ops mirror cwal's C code) ---
+
+fn clamp_byte(value: f32) -> u8 {
+    (value.clamp(0.0, 255.0) + 0.5) as u8
+}
+
+/// cwal `darken_color`: multiplicative crush toward black (truncates).
+fn darken(color: &Rgb, amount: f32) -> Rgb {
+    let amount = amount.clamp(0.0, 1.0);
     Rgb(
-        (f32::from(color.0) * factor).round().clamp(0.0, 255.0) as u8,
-        (f32::from(color.1) * factor).round().clamp(0.0, 255.0) as u8,
-        (f32::from(color.2) * factor).round().clamp(0.0, 255.0) as u8,
+        (f32::from(color.0) * (1.0 - amount)) as u8,
+        (f32::from(color.1) * (1.0 - amount)) as u8,
+        (f32::from(color.2) * (1.0 - amount)) as u8,
     )
 }
 
-/// Quantize `path` into a 16-color scheme.
-///
-/// Ordering mirrors cwal's pywal shape (probed 2026-10-14 and pinned here):
-/// dark `eula…jpg --mode dark` gave `background=color0=#1d1a1b`,
-/// `foreground=cursor=color15=#d1d1d1`; light `flantia…jpg --mode light`
-/// gave `background=color0=#e0d9df`, `foreground=cursor=color15=#161516`.
-/// Cached dark schemes show `color15` ≈ neutral (205–209); cached light
-/// schemes show `color0` ≈ light (206–229) and `color15` ≈ near-black
-/// (20–22). Hence extremes are image-derived but neutralized, while
-/// `background=color0` / `foreground=color15` / `cursor=foreground` holds
-/// in both modes with the ramp direction flipped.
+/// cwal `lighten_color`: mix toward white (truncates).
+fn lighten(color: &Rgb, amount: f32) -> Rgb {
+    let amount = amount.clamp(0.0, 1.0);
+    Rgb(
+        (f32::from(color.0) + (255.0 - f32::from(color.0)) * amount) as u8,
+        (f32::from(color.1) + (255.0 - f32::from(color.1)) * amount) as u8,
+        (f32::from(color.2) + (255.0 - f32::from(color.2)) * amount) as u8,
+    )
+}
+
+fn rgb_to_hsl(color: &Rgb) -> (f32, f32, f32) {
+    let (r, g, b) = (f32::from(color.0) / 255.0, f32::from(color.1) / 255.0, f32::from(color.2) / 255.0);
+    let max = r.max(g).max(b);
+    let min = r.min(g).min(b);
+    let (sum, range) = (max + min, max - min);
+    let l = sum / 2.0;
+    let (mut h, mut s) = (0.0, 0.0);
+    if range != 0.0 {
+        s = if l <= 0.5 { range / sum } else { range / (2.0 - sum) };
+        if r == max {
+            h = (g - b) / range;
+        } else if g == max {
+            h = 2.0 + (b - r) / range;
+        } else {
+            h = 4.0 + (r - g) / range;
+        }
+        h = (h / 6.0) % 1.0;
+        if h < 0.0 {
+            h += 1.0;
+        }
+    }
+    (h, l, s)
+}
+
+fn hls_to_rgb(h: f32, l: f32, s: f32) -> Rgb {
+    fn calc(t: f32, temp1: f32, temp2: f32) -> f32 {
+        if 6.0 * t < 1.0 {
+            temp2 + (temp1 - temp2) * 6.0 * t
+        } else if 2.0 * t < 1.0 {
+            temp1
+        } else if 3.0 * t < 2.0 {
+            temp2 + (temp1 - temp2) * (2.0 / 3.0 - t) * 6.0
+        } else {
+            temp2
+        }
+    }
+    let (r, g, b) = if s == 0.0 {
+        (l, l, l)
+    } else {
+        let temp1 = if l < 0.5 { l * (1.0 + s) } else { l + s - l * s };
+        let temp2 = 2.0 * l - temp1;
+        let tempr = (h + 1.0 / 3.0) % 1.0;
+        let tempb = (h - 1.0 / 3.0 + 1.0) % 1.0;
+        (calc(tempr, temp1, temp2), calc(h, temp1, temp2), calc(tempb, temp1, temp2))
+    };
+    Rgb(clamp_byte(r * 255.0), clamp_byte(g * 255.0), clamp_byte(b * 255.0))
+}
+
+/// cwal `saturate_color`: HSL saturation shift.
+fn saturate(color: &Rgb, amount: f32) -> Rgb {
+    let (h, l, s) = rgb_to_hsl(color);
+    hls_to_rgb(h, l, (s + amount).clamp(0.0, 1.0))
+}
+
+fn rgb_to_hsv(color: &Rgb) -> (f32, f32, f32) {
+    let (r, g, b) = (f32::from(color.0) / 255.0, f32::from(color.1) / 255.0, f32::from(color.2) / 255.0);
+    let max = r.max(g).max(b);
+    let min = r.min(g).min(b);
+    let delta = max - min;
+    let v = max;
+    if delta < 0.00001 {
+        return (0.0, 0.0, v);
+    }
+    let s = delta / max;
+    let mut h = if r >= max {
+        (g - b) / delta
+    } else if g >= max {
+        2.0 + (b - r) / delta
+    } else {
+        4.0 + (r - g) / delta
+    };
+    h *= 60.0;
+    if h < 0.0 {
+        h += 360.0;
+    }
+    (h, s, v)
+}
+
+fn hsv_to_rgb(h: f32, s: f32, v: f32) -> Rgb {
+    let (r, g, b) = if s == 0.0 {
+        (v, v, v)
+    } else {
+        let hh = h / 60.0;
+        let i = hh as i32;
+        let f = hh - i as f32;
+        let p = v * (1.0 - s);
+        let q = v * (1.0 - s * f);
+        let t = v * (1.0 - s * (1.0 - f));
+        match i {
+            0 => (v, t, p),
+            1 => (q, v, p),
+            2 => (p, v, t),
+            3 => (p, q, v),
+            4 => (t, p, v),
+            5 => (v, p, q),
+            _ => (0.0, 0.0, 0.0),
+        }
+    };
+    Rgb(clamp_byte(r * 255.0), clamp_byte(g * 255.0), clamp_byte(b * 255.0))
+}
+
+/// cwal `w3_luminance`: WCAG relative luminance.
+fn w3_luminance(color: &Rgb) -> f32 {
+    let mut channels = [f32::from(color.0) / 255.0, f32::from(color.1) / 255.0, f32::from(color.2) / 255.0];
+    for channel in channels.iter_mut() {
+        *channel = if *channel <= 0.04045 {
+            *channel / 12.92
+        } else {
+            ((*channel + 0.055) / 1.055).powf(2.4)
+        };
+    }
+    0.2126 * channels[0] + 0.7152 * channels[1] + 0.0722 * channels[2]
+}
+
+/// cwal `boost_dark_colors`: lift accents from dark images (slots 1..6).
+fn boost_dark(accents: &mut [Rgb]) {
+    for color in accents.iter_mut() {
+        let (h, mut s, mut v) = rgb_to_hsv(color);
+        let mut changed = false;
+        if v < 0.25 {
+            v += 0.3 * (1.0 - v);
+            changed = true;
+        }
+        if s < 0.20 {
+            s += 0.4 * (1.0 - s);
+            changed = true;
+        }
+        if changed {
+            *color = hsv_to_rgb(h, s, v);
+        }
+    }
+}
+
+/// cwal `boost_light_colors`: tame accents from light images (slots 1..6).
+fn boost_light(accents: &mut [Rgb]) {
+    for color in accents.iter_mut() {
+        if w3_luminance(color) > 0.6 {
+            *color = darken(color, 0.3);
+        }
+        let (h, mut s, v) = rgb_to_hsv(color);
+        if s < 0.20 {
+            s += 0.4 * (1.0 - s);
+            *color = hsv_to_rgb(h, s, v);
+        }
+    }
+}
+
+/// Quantize `path` into a 16-color scheme with cwal's derivation structure:
+/// 8 Lab-space base colors ordered by cluster size, `process_colors`
+/// adjustments (darken/lighten/saturate/boosts), then `generate_16_colors`.
+/// Reference values were probed from cwal 0.10.1 on 2026-10-14 (see the
+/// `matches_cwal_on_fixtures` test): e.g. dark gives
+/// `background=color0=#1d1a1b`, `foreground=cursor=color15=#d1d1d1`.
 pub fn generate(
     path: &std::path::Path,
     wallpaper_abs: &str,
@@ -347,74 +592,89 @@ pub fn generate(
     if pixels.is_empty() {
         return Err(format!("Error: no pixels decoded from {}", path.display()));
     }
-    let mut clusters = kmeans(&pixels, 16, 12);
-    clusters.sort_by_key(luminance);
-    let (dark_half, bright_half) = clusters.split_at(8);
-    let mut dark_band = dark_half.to_vec();
-    let mut bright_band = bright_half.to_vec();
-    dark_band.sort_by(|a, b| hue_angle(a).total_cmp(&hue_angle(b)));
-    bright_band.sort_by(|a, b| hue_angle(a).total_cmp(&hue_angle(b)));
+    let mut sized = kmeans_lab(&pixels, 8, 12);
+    sized.sort_by(|a, b| b.1.cmp(&a.1));
+    let light = mode == "light";
+    // cwal always derives the background from a representative base color and
+    // crushes it multiplicatively (darken 0.70); picking the *darkest* cluster
+    // instead latches onto small saturated regions (pure-blue backgrounds).
+    // Like cwal's dominant muted base, take the largest cluster on the
+    // mode's side of the luminance split.
+    let base0_index = sized
+        .iter()
+        .position(|(c, _)| {
+            let lum = luminance(c);
+            if light { lum > 128 } else { lum < 128 }
+        })
+        .unwrap_or(0);
+    let mut base: Vec<Rgb> = sized.into_iter().map(|(c, _)| c).collect();
+    base.swap(0, base0_index);
+    // Six accents: the next largest clusters (cwal consumes 7 of its 8 bases,
+    // discarding one; we drop the smallest).
+    let mut accents: Vec<Rgb> = base.iter().skip(1).take(6).cloned().collect();
 
-    let darkest = clusters[0];
-    let lightest = clusters[15];
-    let (background, foreground, mut middle): (Rgb, Rgb, Vec<Rgb>) = if mode == "light" {
-        let background = {
-            let lifted = desaturate(&lightest, 0.65);
-            if luminance(&lifted) < 205 {
-                scale_to_luminance(&lifted, 215)
-            } else {
-                lifted
-            }
-        };
-        let foreground = if luminance(&darkest) > 40 {
-            scale_to_luminance(&darkest, 24)
-        } else {
-            darkest
-        };
-        let mut middle = Vec::with_capacity(14);
-        middle.extend(bright_band.iter().filter(|c| **c != lightest));
-        middle.extend(dark_band.iter().filter(|c| **c != darkest));
-        (background, foreground, middle)
+    // Note: cwal `reverse_colors` mirrors its cube-ordered bases for light
+    // mode; ours are size-ordered with the mode-side dominant base already at
+    // [0], so no reversal is needed.
+    let (accents, background) = if light {
+        boost_light(&mut accents);
+        let mut background = base[0];
+        // cwal light background luminance targeting.
+        let lum = w3_luminance(&background);
+        if lum < 0.88 {
+            background = lighten(&background, 0.93 - lum);
+        } else if lum > 0.97 {
+            background = darken(&background, lum - 0.93);
+        }
+        (accents, background)
     } else {
-        let background = if luminance(&darkest) > 64 {
-            scale_to_luminance(&darkest, 40)
+        boost_dark(&mut accents);
+        let first = base[0];
+        let background = if first.0 < 16 || first.1 < 16 || first.2 < 16 {
+            saturate(&lighten(&first, 0.03), 0.40)
         } else {
-            darkest
+            darken(&first, 0.70)
         };
-        let foreground = {
-            // Neutral near-white with a whisper of the image's lightest hue.
-            let tinted = desaturate(&lightest, 0.85);
-            let grey = Rgb(206, 206, 206);
-            Rgb(
-                ((f32::from(grey.0) * 0.85 + f32::from(tinted.0) * 0.15).round()) as u8,
-                ((f32::from(grey.1) * 0.85 + f32::from(tinted.1) * 0.15).round()) as u8,
-                ((f32::from(grey.2) * 0.85 + f32::from(tinted.2) * 0.15).round()) as u8,
-            )
-        };
-        let mut middle = Vec::with_capacity(14);
-        middle.extend(dark_band.iter().filter(|c| **c != darkest));
-        middle.extend(bright_band.iter().filter(|c| **c != lightest));
-        (background, foreground, middle)
+        (accents, background)
     };
-    // Dedupe fallthrough (solid-color images): refill from hue-spread shades
-    // of the background/foreground so all 16 entries stay usable.
-    while middle.len() < 14 {
-        let anchor = if middle.len() % 2 == 0 { background } else { foreground };
-        let step = (middle.len() as u8).wrapping_mul(13);
-        middle.push(Rgb(
-            anchor.0.wrapping_add(step),
-            anchor.1.wrapping_add(step / 2),
-            anchor.2.wrapping_sub(step / 3),
-        ));
-    }
-    middle.truncate(14);
 
     let mut colors = [Rgb(0, 0, 0); 16];
     colors[0] = background;
-    for (index, color) in middle.iter().take(14).enumerate() {
-        colors[index + 1] = *color;
+    for (index, accent) in accents.iter().take(6).enumerate() {
+        colors[index + 1] = *accent;
     }
-    colors[15] = foreground;
+    if light {
+        colors[7] = saturate(&darken(&background, 0.60), 0.05);
+        colors[8] = saturate(&darken(&background, 0.30), 0.10);
+        colors[15] = darken(&background, 0.90);
+        // cwal cols16 `darken` mode (the configured default).
+        for i in 0..6 {
+            colors[i + 9] = saturate(&darken(&accents[i], 0.15), 0.30);
+        }
+    } else {
+        colors[7] = saturate(&lighten(&background, 0.60), 0.05);
+        colors[8] = saturate(&lighten(&background, 0.40), 0.10);
+        colors[15] = lighten(&background, 0.80);
+        for i in 0..6 {
+            colors[i + 9] = saturate(&lighten(&accents[i], 0.25), 0.30);
+        }
+    }
+    // Solid-color images can collapse clusters: refill from derived shades so
+    // all 16 entries stay usable.
+    let mut step = 0u8;
+    while colors[1..15].iter().collect::<std::collections::HashSet<_>>().len() < 8 {
+        step = step.wrapping_add(13);
+        let anchor = if step % 2 == 0 { background } else { colors[15] };
+        colors[1 + (step as usize % 14)] = Rgb(
+            anchor.0.wrapping_add(step),
+            anchor.1.wrapping_add(step / 2),
+            anchor.2.wrapping_sub(step / 3),
+        );
+        if step > 200 {
+            break;
+        }
+    }
+    let foreground = colors[15];
     Ok(Scheme {
         wallpaper: wallpaper_abs.to_string(),
         mode: mode.to_string(),
@@ -425,4 +685,7 @@ pub fn generate(
         colors,
     })
 }
+
+
+
 

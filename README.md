@@ -1,5 +1,7 @@
 # ColorEclipse
 
+![ColorEclipse Overview](.github/assets/overview.gif)
+
 Light/dark theme applier for [ArchEclipse](https://github.com/AymanLyesri/ArchEclipse).
 Rust replacement for hypr's former `theme/scripts/*.sh`, shipped as its own
 package so the compositor config no longer compiles anything at login.
@@ -25,13 +27,13 @@ dist/aur/PKGBUILD       coloreclipse-git (AUR)
 
 ## Usage
 
-| Command | Effect |
-|---|---|
-| `coloreclipse get` | print the current variant (`dark`\|`light`) |
-| `coloreclipse switch` | toggle the variant, then re-apply everything |
-| `coloreclipse switch dark\|light` | set the variant, then re-apply everything |
-| `coloreclipse apply` | re-apply cursor/GTK/icon/colors for the current variant |
-| `coloreclipse wal [wallpaper]` | regenerate internal colors (defaults to walleclipse's current wallpaper) |
+| Command                           | Effect                                                                   |
+| --------------------------------- | ------------------------------------------------------------------------ |
+| `coloreclipse get`                | print the current variant (`dark`\|`light`)                              |
+| `coloreclipse switch`             | toggle the variant, then re-apply everything                             |
+| `coloreclipse switch dark\|light` | set the variant, then re-apply everything                                |
+| `coloreclipse apply`              | re-apply cursor/GTK/icon/colors for the current variant                  |
+| `coloreclipse wal [wallpaper]`    | regenerate internal colors (defaults to walleclipse's current wallpaper) |
 
 `switch` refuses to run while `autovariant` is enabled, and `wal` (auto-)picks
 light/dark from the wallpaper's average brightness when it is — the same
@@ -54,7 +56,8 @@ Settings toggle writes this file; deleting it resets to auto.
 Used as found, each degrading gracefully when absent: `gsettings` (glib2),
 `hyprctl` (hyprland), `killall` (psmisc), `notify-send` (libnotify), and `ffmpeg` for the animated
 wallpaper frame extraction (cached in `~/.cache/wall-thumbs`). Colors are generated
-internally (k-means over a thumbnail via the `image` crate) into the pywal-style
+internally (Lab-space k-means over a thumbnail via the `image` crate, with cwal's
+darken/lighten/boost derivation) into the pywal-style
 file set in `~/.cache/coloreclipse` (`colors.sh`, `colors.scss`, `colors.json`,
 `sequences`, … — 55 templates plus `sequences`); there is no `~/.cache/cwal`
 shim, so point consumers at the new dir. The GTK/icon/
