@@ -1,7 +1,7 @@
 # Maintainer: AymanLyesri <https://github.com/AymanLyesri>
 pkgname=coloreclipse-git
 pkgver=0.1.0
-pkgrel=1
+pkgrel=2
 pkgdesc="Theme variant and GTK/icon/cursor applier with internal wallpaper colors for ArchEclipse"
 arch=('x86_64')
 url="https://github.com/AymanLyesri/ColorEclipse"
@@ -31,11 +31,15 @@ pkgver() {
 
 build() {
   cd ColorEclipse
+  # Distro rust defaults to linker `x86_64-linux-gnu-gcc`, which CachyOS gcc
+  # does not provide (only x86_64-pc/v3/v4-linux-gnu-gcc). Use portable `cc`.
+  export RUSTFLAGS="${RUSTFLAGS:+$RUSTFLAGS }-C linker=cc"
   cargo build --release --locked
 }
 
 check() {
   cd ColorEclipse
+  export RUSTFLAGS="${RUSTFLAGS:+$RUSTFLAGS }-C linker=cc"
   cargo test --locked
 }
 
