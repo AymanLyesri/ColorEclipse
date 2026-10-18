@@ -48,6 +48,7 @@ fn base_color(role: &str, scheme: &Scheme) -> Option<Rgb> {
         "background" => Some(scheme.background),
         "foreground" => Some(scheme.foreground),
         "cursor" => Some(scheme.cursor),
+        "accent" => Some(scheme.accent),
         _ => None,
     }
 }
@@ -2161,6 +2162,11 @@ $background: {background};
 $foreground: {foreground};
 $cursor: {cursor};
 
+// Accent: a vivid, legible color for UIs (sliders, focus rings, active states).
+// cwal has no such concept — color5 is a prominence rank and is often too dim
+// to use. Consumers that do not know this variable simply ignore it.
+$accent: {accent};
+
 // Colors
 $color0: {color0};
 $color1: {color1};
@@ -2413,6 +2419,7 @@ mod tests {
             background: Rgb(29, 26, 27),
             foreground: Rgb(209, 209, 209),
             cursor: Rgb(209, 209, 209),
+            accent: Rgb(209, 209, 209),
             colors,
         }
     }
@@ -2460,7 +2467,22 @@ mod tests {
             let close = open + close_rel;
             let preceded_by_dollar = open > 0 && bytes[open - 1] == b'$';
             let name = &rendered[open + 1..close];
-            if !preceded_by_dollar && super::lookup(name, &test_scheme()).is_some() {
+            // Flag any identifier-shaped placeholder that did not expand —
+            // *including names `lookup` does not know*. Skipping unknown names
+            // would make this test blind to typos: a misspelled or not-yet-added
+            // placeholder would slip through unrendered.
+            //
+            // Literal braces are still fine: JSON objects start with a quote
+            // (`{"color0": ...}`), CSS blocks contain `:` (`{color:red}`), and
+            // `${...}` shell vars are handled above, so none of those look like
+            // a bare identifier.
+            let looks_like_placeholder = !name.is_empty()
+                && !preceded_by_dollar
+                && name
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.')
+                && !name.starts_with(|c: char| c.is_ascii_digit());
+            if looks_like_placeholder && super::lookup(name, &test_scheme()).is_none() {
                 return Some(name.to_string());
             }
             cursor = close + 1;

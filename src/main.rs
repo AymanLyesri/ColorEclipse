@@ -43,17 +43,23 @@ fn theme_conf() -> PathBuf {
     config_dir().join("coloreclipse/theme.conf")
 }
 
-/// WallEclipse's config dir: `$WALLECLIPSE_CONFIG_DIR`, else
-/// `~/.config/walleclipse/config` (same lookup as WallEclipse itself).
-fn walleclipse_config_dir() -> PathBuf {
-    match env::var("WALLECLIPSE_CONFIG_DIR") {
-        Ok(dir) if !dir.is_empty() => PathBuf::from(dir),
-        _ => home().join(".config/walleclipse/config"),
-    }
-}
-
-fn current_wallpaper_conf() -> PathBuf {
-    walleclipse_config_dir().join("current.conf")
+/// The wallpaper the last generated palette was built from, recorded in
+/// `colors.json`.
+///
+/// This is how we resolve "which wallpaper?" without asking anyone. Coloreclipse
+/// deliberately knows nothing about whatever applies wallpapers: callers pass the
+/// path explicitly (`coloreclipse wal <path>`), and we remember the last one we
+/// were given so a later `switch`/`apply` recolors from the same image. Reaching
+/// into another tool's config to guess would invert the dependency — they call
+/// us, not the other way round.
+fn last_generated_wallpaper(dir: &Path) -> Option<String> {
+    let text = fs::read_to_string(dir.join("colors.json")).ok()?;
+    // Written by `TEMPLATE_COLORS_JSON`, so the shape is known: the value is
+    // the second quoted run after the `"wallpaper"` key. Paths containing a
+    // double quote would already corrupt the file, so no unescaping is needed.
+    let value = text.split_once("\"wallpaper\"")?.1.split_once('"')?.1;
+    let path = &value[..value.find('"')?];
+    (!path.is_empty()).then(|| path.to_string())
 }
 
 fn thumb_cache() -> PathBuf {
@@ -281,12 +287,9 @@ fn run_wal(wallpaper_arg: Option<&str>) -> Result<&'static str, String> {
 
     let mut wallpaper = match wallpaper_arg {
         Some(path) => expand_home(path),
-        None if current_wallpaper_conf().is_file() => expand_home(
-            fs::read_to_string(current_wallpaper_conf())
-                .map_err(|e| e.to_string())?
-                .trim(),
-        ),
-        None => return Err("Error: No wallpaper specified and current.conf not found".to_string()),
+        None => last_generated_wallpaper(&wal_out_dir()).ok_or_else(|| {
+            "Error: No wallpaper known. Pass one explicitly: coloreclipse wal <path>".to_string()
+        })?,
     };
 
     if is_animated(&wallpaper) {
@@ -438,18 +441,38 @@ mod tests {
     }
 
     #[test]
+    fn last_wallpaper_is_read_back_from_the_generated_palette() {
+        let dir = env::temp_dir().join(format!("coloreclipse-lastwp-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        // No palette yet.
+        assert_eq!(last_generated_wallpaper(&dir), None);
+
+        // The shape render.rs writes, including a path with a space.
+        fs::write(dir.join("colors.json"), "{\n    \"wallpaper\": \"/tmp/some dir/wall.jpg\",\n    \"alpha\": \"1.00\"\n}\n").unwrap();
+        assert_eq!(
+            last_generated_wallpaper(&dir),
+            Some("/tmp/some dir/wall.jpg".to_string())
+        );
+
+        // A palette written before this feature, or truncated by a crash.
+        fs::write(dir.join("colors.json"), "{}\n").unwrap();
+        assert_eq!(last_generated_wallpaper(&dir), None);
+        fs::write(dir.join("colors.json"), "{\n    \"wallpaper\": \"\",\n").unwrap();
+        assert_eq!(last_generated_wallpaper(&dir), None);
+        fs::write(dir.join("colors.json"), "not json at all").unwrap();
+        assert_eq!(last_generated_wallpaper(&dir), None);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn home_expansion() {
         let home = home().to_string_lossy().into_owned();
         assert_eq!(expand_home("$HOME/x.jpg"), format!("{home}/x.jpg"));
         assert_eq!(expand_home("~/x.jpg"), format!("{home}/x.jpg"));
         assert_eq!(expand_home("/abs/x.jpg"), "/abs/x.jpg");
-    }
-
-    #[test]
-    fn walleclipse_conf_dir_env_override() {
-        env::set_var("WALLECLIPSE_CONFIG_DIR", "/tmp/wc-test");
-        assert_eq!(current_wallpaper_conf(), PathBuf::from("/tmp/wc-test/current.conf"));
-        env::remove_var("WALLECLIPSE_CONFIG_DIR");
     }
 
     #[test]

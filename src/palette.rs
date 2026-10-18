@@ -10,6 +10,10 @@ pub struct Scheme {
     pub background: Rgb,
     pub foreground: Rgb,
     pub cursor: Rgb,
+    /// A vivid, legible accent for UIs (sliders, focus rings, active states).
+    /// Not one of the 16 slots: cwal's `color5` is a prominence rank and is
+    /// often too dim to use.
+    pub accent: Rgb,
     pub colors: [Rgb; 16],
 }
 
@@ -130,6 +134,143 @@ mod tests {
             u8::from_str_radix(&hex[2..4], 16).unwrap(),
             u8::from_str_radix(&hex[4..6], 16).unwrap(),
         )
+    }
+
+    fn hsv_saturation(color: &Rgb) -> f32 {
+        rgb_to_hsv(color).1
+    }
+
+    /// The reported bug: on a saturated wallpaper (a yellow cyberpunk image)
+    /// the light-mode background came out as a near-fully-saturated yellow
+    /// field, because cwal's `lighten(bg, 0.93 - lum)` only mixes that
+    /// fraction of the way to white and so never reaches its own 0.93 target.
+    /// cwal's own output for such an image is a desaturated near-neutral, and
+    /// a light theme background must not be a saturated colour.
+    #[test]
+    fn light_background_is_near_white_with_only_a_tint() {
+        // A big saturated yellow field, like the workspace-3 wallpaper.
+        let path = write_rgba_png("saturated-light", 96, 96, |x, _| {
+            let band = (x / 12) % 3;
+            match band {
+                0 => [233, 239, 45, 255],
+                1 => [214, 226, 96, 255],
+                _ => [246, 240, 140, 255],
+            }
+        });
+        let s = generate(&path, "wall.png", "light").unwrap();
+        let _ = std::fs::remove_file(&path);
+
+        assert!(
+            w3_luminance(&s.background) >= LIGHT_BACKGROUND_LUMINANCE,
+            "light background too dark: w3 {:.3} < {LIGHT_BACKGROUND_LUMINANCE}",
+            w3_luminance(&s.background)
+        );
+        assert!(
+            hsv_saturation(&s.background) <= LIGHT_BACKGROUND_MAX_TINT,
+            "light background too saturated: {:.3} > {LIGHT_BACKGROUND_MAX_TINT}",
+            hsv_saturation(&s.background)
+        );
+        // Readable: the dark foreground must still clear WCAG AA on it.
+        let fg_lum = w3_luminance(&s.foreground);
+        let ratio = (fg_lum.max(w3_luminance(&s.background)) + 0.05)
+            / (fg_lum.min(w3_luminance(&s.background)) + 0.05);
+        assert!(ratio >= 7.0, "foreground contrast on light background: {ratio:.2}:1");
+    }
+
+    /// A dark-mode background must be left completely alone by the light
+    /// normalization.
+    #[test]
+    fn dark_background_is_untouched_by_light_normalization() {
+        let path = fixture("dark-anime.jpg");
+        let s = generate(&path, &path.to_string_lossy(), "dark").unwrap();
+        // Recorded 2026-10-17; the light path must not reach into dark mode.
+        assert_eq!(s.background, hex_color("100f13"));
+        assert!(w3_luminance(&s.background) < 0.5, "expected a dark background");
+    }
+
+    /// The shell accent must be vivid *and* legible. cwal's `color5` is a
+    /// prominence rank and can be a dim near-grey (~2.6:1 on a dark
+    /// background), which is useless for sliders and focus rings.
+    #[test]
+    fn accent_is_vivid_and_legible_against_the_background() {
+        for (name, mode) in [("dark-anime.jpg", "dark"), ("light-scenic.jpg", "light")] {
+            let path = fixture(name);
+            let s = generate(&path, &path.to_string_lossy(), mode).unwrap();
+            let bg = w3_luminance(&s.background);
+            let accent_lum = w3_luminance(&s.accent);
+            let ratio = (accent_lum.max(bg) + 0.05) / (accent_lum.min(bg) + 0.05);
+            assert!(
+                ratio >= MIN_ACCENT_CONTRAST,
+                "{name} {mode}: accent {:?} only {ratio:.2}:1 on bg {:?}",
+                s.accent, s.background
+            );
+            // Vivid: not one of the deliberately grey derived slots.
+            assert!(
+                !s.colors[7..9].contains(&s.accent),
+                "{name} {mode}: accent fell back to a grey slot"
+            );
+            // Pin the wiring: `generate` must actually call `pick_accent`
+            // rather than picking a fixed slot like cwal's color5. Without
+            // this, swapping the call back to `colors[5]` still satisfies every
+            // other assertion here on these fixtures.
+            assert_eq!(
+                s.accent,
+                pick_accent(&s.background, &s.colors[1..7]),
+                "{name} {mode}: generate() must source the accent from pick_accent"
+            );
+        }
+    }
+
+    /// The measured real case: on a dark wallpaper cwal's `color5` was
+    /// `#36519a`, only 2.60:1 against the background. Ranking by prominence
+    /// alone would keep picking it; the accent must instead come from the
+    /// vivid, legible ones.
+    #[test]
+    fn accent_rejects_the_dim_color5_in_favour_of_a_vivid_one() {
+        let background = hex_color("0c0c15");
+        let accents = [
+            hex_color("33427a"), // vivid but dim on this bg
+            hex_color("5967a6"),
+            hex_color("332b57"),
+            hex_color("9697c1"), // dim, desaturated
+            hex_color("36519a"), // <- cwal's color5, 2.60:1: rejected
+            hex_color("da7dd1"), // vivid and legible
+        ];
+        let accent = pick_accent(&background, &accents);
+        assert_ne!(accent, accents[4], "picked the too-dim color5");
+        assert_eq!(accent, accents[5]);
+    }
+
+    /// `generate` must take the accent from `pick_accent`, not from a fixed
+    /// slot. On the two image fixtures `pick_accent` happens to agree with
+    /// `color5`, so they cannot tell the two apart; this band layout is a case
+    /// where they genuinely differ, which pins the wiring.
+    #[test]
+    fn generate_sources_the_accent_from_pick_accent_not_a_fixed_slot() {
+        let bands: [[u8; 3]; 8] = [
+            [220, 4, 101],
+            [170, 31, 173],
+            [29, 90, 218],
+            [229, 172, 27],
+            [30, 95, 19],
+            [112, 121, 108],
+            [253, 16, 255],
+            [25, 175, 96],
+        ];
+        let path = write_rgba_png("accent-pick", 64, 128, |_, y| {
+            let band = bands[(y / 16) as usize % bands.len()];
+            [band[0], band[1], band[2], 255]
+        });
+        let s = generate(&path, "wall.png", "light").unwrap();
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(s.colors[5], Rgb(220, 4, 101), "fixture drifted");
+        assert_ne!(
+            s.accent, s.colors[5],
+            "accent fell back to cwal's color5 slot"
+        );
+        assert_eq!(s.accent, Rgb(30, 95, 19));
+        assert_eq!(s.accent, pick_accent(&s.background, &s.colors[1..7]));
     }
 
     /// Parity with cwal's own output on the same fixtures (recorded 2026-10-14
@@ -544,6 +685,96 @@ fn w3_luminance(color: &Rgb) -> f32 {
     0.2126 * channels[0] + 0.7152 * channels[1] + 0.0722 * channels[2]
 }
 
+/// cwal's own target for a light-mode background is w3_luminance 0.93, but it
+/// gets there with `lighten(bg, 0.93 - lum)`, which only mixes that fraction
+/// of the way to white and never arrives. These are the values we actually
+/// want: bright enough to read as a light surface, and barely tinted at all so
+/// a saturated wallpaper cannot flood the whole screen with one hue.
+pub const LIGHT_BACKGROUND_LUMINANCE: f32 = 0.92;
+pub const LIGHT_BACKGROUND_MAX_TINT: f32 = 0.045;
+
+/// WCAG minimum contrast for a non-text/UI accent (WCAG 1.4.11). Below this an
+/// accent is a valid palette entry but unusable for sliders and focus rings.
+pub const MIN_ACCENT_CONTRAST: f32 = 3.0;
+
+/// WCAG contrast ratio between two colors, 1.0..=21.0.
+fn contrast_ratio(a: &Rgb, b: &Rgb) -> f32 {
+    let (la, lb) = (w3_luminance(a), w3_luminance(b));
+    (la.max(lb) + 0.05) / (la.min(lb) + 0.05)
+}
+
+/// Choose a UI accent from the six palette accents.
+///
+/// cwal orders accents by cluster size, so `color5` is simply the
+/// fifth-biggest region of the wallpaper — which on a dark wallpaper is often
+/// a dim near-grey (measured: `#36519a` at 2.60:1). That is a legitimate
+/// palette entry but useless for sliders, focus rings and active states.
+///
+/// Rank by contrast x saturation instead. Contrast keeps the accent legible,
+/// saturation keeps it from being grey, and multiplying means neither wins
+/// outright: a slightly duller color at twice the contrast beats a marginally
+/// more vivid but barely-visible one. The contrast floor is dropped for the
+/// fallback so a palette that cannot meet it at all still yields an accent.
+pub fn pick_accent(background: &Rgb, accents: &[Rgb]) -> Rgb {
+    let mut best: Option<Rgb> = None;
+    let mut best_score = f32::NEG_INFINITY;
+    let mut fallback = accents.first().copied().unwrap_or(*background);
+    let mut fallback_score = f32::NEG_INFINITY;
+    for candidate in accents {
+        let contrast = contrast_ratio(candidate, background);
+        let score = contrast * rgb_to_hsv(candidate).1;
+        if score > fallback_score {
+            fallback_score = score;
+            fallback = *candidate;
+        }
+        if contrast < MIN_ACCENT_CONTRAST {
+            continue;
+        }
+        if score > best_score {
+            best_score = score;
+            best = Some(*candidate);
+        }
+    }
+    best.unwrap_or(fallback)
+}
+
+/// Force a light-mode background to actually be light.
+///
+/// cwal targets w3_luminance 0.93 via `lighten(bg, 0.93 - lum)`, but that only
+/// mixes that *fraction* toward white, so the result never arrives: measured
+/// light backgrounds land at luminance 0.67-0.79, i.e. mid-tones. On a
+/// saturated wallpaper that is a full-screen colour field — a yellow
+/// cyberpunk wallpaper produced a `#e9ef2d` background, where cwal itself
+/// produced a desaturated `#e0dadd`.
+///
+/// Mixing with white is hue-preserving: all three channels converge on 255 at
+/// the same rate, so the ratios that define hue are unchanged. That raises
+/// lightness and drops tint while keeping the wallpaper's hue as a hint.
+fn normalize_light_background(color: &Rgb) -> Rgb {
+    let lum = w3_luminance(color);
+    let tint = rgb_to_hsv(color).1;
+    if lum >= LIGHT_BACKGROUND_LUMINANCE && tint <= LIGHT_BACKGROUND_MAX_TINT {
+        return *color;
+    }
+    // Both constraints improve monotonically toward white, so one binary
+    // search finds the *least* change satisfying both — keeping as much of the
+    // wallpaper's character as the constraints allow.
+    let mut low = 0.0f32;
+    let mut high = 1.0f32;
+    for _ in 0..20 {
+        let mid = (low + high) / 2.0;
+        let candidate = lighten(color, mid);
+        if w3_luminance(&candidate) >= LIGHT_BACKGROUND_LUMINANCE
+            && rgb_to_hsv(&candidate).1 <= LIGHT_BACKGROUND_MAX_TINT
+        {
+            high = mid;
+        } else {
+            low = mid;
+        }
+    }
+    lighten(color, high)
+}
+
 /// cwal `boost_dark_colors`: lift accents from dark images (slots 1..6).
 fn boost_dark(accents: &mut [Rgb]) {
     for color in accents.iter_mut() {
@@ -619,14 +850,17 @@ pub fn generate(
     let (accents, background) = if light {
         boost_light(&mut accents);
         let mut background = base[0];
-        // cwal light background luminance targeting.
+        // cwal light background luminance targeting. Keep the derivation, then
+        // force the result to actually be a light background: cwal's own step
+        // above only mixes part of the way to white, so it can stop at a
+        // mid-tone and, on a saturated wallpaper, at a strongly tinted one.
         let lum = w3_luminance(&background);
         if lum < 0.88 {
             background = lighten(&background, 0.93 - lum);
         } else if lum > 0.97 {
             background = darken(&background, lum - 0.93);
         }
-        (accents, background)
+        (accents, normalize_light_background(&background))
     } else {
         boost_dark(&mut accents);
         let first = base[0];
@@ -675,6 +909,7 @@ pub fn generate(
         }
     }
     let foreground = colors[15];
+    let accent = pick_accent(&background, &colors[1..7]);
     Ok(Scheme {
         wallpaper: wallpaper_abs.to_string(),
         mode: mode.to_string(),
@@ -682,6 +917,7 @@ pub fn generate(
         background,
         foreground,
         cursor: foreground,
+        accent,
         colors,
     })
 }
