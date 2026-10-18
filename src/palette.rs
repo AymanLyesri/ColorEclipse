@@ -57,6 +57,55 @@ mod tests {
         assert_eq!(variant_for_pixels(&[s.foreground]), "dark");
     }
 
+    /// Light mode must not pick the darkest readable cluster: near-black wins
+    /// `contrast × tint` (measured on the light wallpaper: `#0f070f` at
+    /// 18.45:1 beat every vivid candidate) and lands in selections as a
+    /// near-black slab. Inside the legible-but-not-slab window the most
+    /// saturated candidate wins instead.
+    #[test]
+    fn light_accent_prefers_the_most_saturated_candidate_in_the_window() {
+        let background = hex_color("f8f6f7");
+        let accents = [
+            hex_color("0f070f"), // 18.45:1, near-black: outside the window
+            hex_color("217fa4"), // 4.21:1, sat 0.80
+            hex_color("d33353"), // 4.47:1, sat 0.76
+            hex_color("492943"), // 11.61:1: too dark
+        ];
+        assert_eq!(pick_light_accent(&background, &accents), accents[1]);
+    }
+
+    /// No candidate inside the window (an all-dark wallpaper): fall back to
+    /// the regular winner lightened toward the background, never a slab.
+    #[test]
+    fn light_accent_falls_back_to_a_lightened_pick() {
+        let background = hex_color("f8f6f7");
+        let accents = [
+            hex_color("0f070f"),
+            hex_color("492943"),
+            hex_color("2b3463"),
+        ];
+        let accent = pick_light_accent(&background, &accents);
+        let ratio = contrast_ratio(&accent, &background);
+        assert!(
+            ratio >= LIGHT_ACCENT_MIN_CONTRAST && ratio < contrast_ratio(&accents[1], &background),
+            "fallback accent {accent:?} at {ratio:.2}:1 is not a lightened pick"
+        );
+        assert_eq!(accent, lighten_light_accent(&pick_accent(&background, &accents), &background));
+    }
+
+    /// Generated light accents must sit inside the window on the fixture; the
+    /// dark variant keeps the raw pick exactly.
+    #[test]
+    fn generated_light_accent_stays_inside_the_contrast_window() {
+        let path = fixture("light-scenic.jpg");
+        let s = generate(&path, &path.to_string_lossy(), "light").unwrap();
+        let ratio = contrast_ratio(&s.accent, &s.background);
+        assert!(
+            (MIN_ACCENT_CONTRAST..=LIGHT_ACCENT_MAX_CONTRAST).contains(&ratio),
+            "light accent {ratio:.2}:1 outside [{MIN_ACCENT_CONTRAST}, {LIGHT_ACCENT_MAX_CONTRAST}]"
+        );
+    }
+
     fn write_rgba_png(name: &str, width: u32, height: u32, fill: impl Fn(u32, u32) -> [u8; 4]) -> PathBuf {
         let mut image = image::RgbaImage::new(width, height);
         for (x, y, pixel) in image.enumerate_pixels_mut() {
@@ -199,8 +248,11 @@ mod tests {
             let bg = w3_luminance(&s.background);
             let accent_lum = w3_luminance(&s.accent);
             let ratio = (accent_lum.max(bg) + 0.05) / (accent_lum.min(bg) + 0.05);
+            // Light mode lightens the accent down toward its 2.5 floor; dark
+            // mode keeps the stricter 3.0 legibility contract.
+            let floor = if mode == "light" { 2.5 } else { MIN_ACCENT_CONTRAST };
             assert!(
-                ratio >= MIN_ACCENT_CONTRAST,
+                ratio >= floor,
                 "{name} {mode}: accent {:?} only {ratio:.2}:1 on bg {:?}",
                 s.accent, s.background
             );
@@ -209,14 +261,76 @@ mod tests {
                 !s.colors[7..9].contains(&s.accent),
                 "{name} {mode}: accent fell back to a grey slot"
             );
-            // Pin the wiring: `generate` must actually call `pick_accent`
-            // rather than picking a fixed slot like cwal's color5. Without
-            // this, swapping the call back to `colors[5]` still satisfies every
-            // other assertion here on these fixtures.
-            assert_eq!(
-                s.accent,
-                pick_accent(&s.background, &s.colors[1..7]),
-                "{name} {mode}: generate() must source the accent from pick_accent"
+            if mode == "dark" {
+                // Dark mode keeps pick_accent's raw winner exactly.
+                assert_eq!(
+                    s.accent,
+                    pick_accent(&s.background, &s.colors[1..7]),
+                    "{name} {mode}: generate() must source the accent from pick_accent"
+                );
+            }
+        }
+    }
+
+    /// In light mode a dark wallpaper accent is a dark slab against a light
+    /// background (measured: selections read as "dark theme" islands). The
+    /// light variant therefore lightens the accent toward the background as
+    /// far as the legibility floor allows, while keeping the wallpaper's
+    /// hue character and never touching dark mode.
+    #[test]
+    fn light_accent_is_lighter_than_the_picker_winner() {
+        for (name, mode) in [("light-scenic.jpg", "light"), ("dark-anime.jpg", "dark")] {
+            let path = fixture(name);
+            let s = generate(&path, &path.to_string_lossy(), mode).unwrap();
+            let raw = pick_accent(&s.background, &s.colors[1..7]);
+            if mode == "dark" {
+                assert_eq!(s.accent, raw, "{name}: dark accent must stay raw");
+                continue;
+            }
+            let raw_ratio = contrast_ratio(&raw, &s.background);
+            let lighten_ratio = contrast_ratio(&s.accent, &s.background);
+            // Any raw accent darker than the floor must actually be lifted:
+            // the lightened accent is a different colour whose contrast sits
+            // at (not above) the floor.
+            if raw_ratio >= 2.5 {
+                assert!(
+                    s.accent != raw,
+                    "{name}: light accent unchanged, still raw {raw_ratio:.2}:1"
+                );
+                // A dramatic raw darkness (the scenic fixture is 10.95:1) must
+                // be lifted by a visible margin; the exact floor reached may
+                // be above 2.5 when the tint floor binds first on muted
+                // accents (measured: 4.07:1 with tint 0.253, still blue).
+                if raw_ratio >= 4.5 {
+                    assert!(
+                        lighten_ratio <= raw_ratio - 2.0,
+                        "{name}: light accent {lighten_ratio:.2}:1 barely lifted from {raw_ratio:.2}:1"
+                    );
+                }
+            }
+            assert!(
+                lighten_ratio >= 2.5,
+                "{name}: light accent {lighten_ratio:.2}:1 below the 2.5 floor (raw {raw_ratio:.2}:1)"
+            );
+        }
+    }
+
+    /// Lightening may not wash the accent into a near-grey: it must remain a
+    /// coloured choice, not a beige one (a tint floor mirrors the shell's
+    /// "vivid and legible" contract on the light side).
+    #[test]
+    fn light_accent_stays_a_color() {
+        let path = fixture("light-scenic.jpg");
+        let s = generate(&path, &path.to_string_lossy(), "light").unwrap();
+        let raw = pick_accent(&s.background, &s.colors[1..7]);
+        // The builder only washes when the raw winner has colour to lose: an
+        // already-pale raw accent is kept instead of being tinted up.
+        if hsv_saturation(&raw) >= 0.25 {
+            assert!(
+                hsv_saturation(&s.accent) >= 0.25,
+                "light accent tint {:.3} washed out (raw {:.3})",
+                hsv_saturation(&s.accent),
+                hsv_saturation(&raw)
             );
         }
     }
@@ -265,12 +379,13 @@ mod tests {
         let _ = std::fs::remove_file(&path);
 
         assert_eq!(s.colors[5], Rgb(220, 4, 101), "fixture drifted");
-        assert_ne!(
-            s.accent, s.colors[5],
-            "accent fell back to cwal's color5 slot"
+        // Light mode ranks by tint inside the contrast window (with a
+        // lightened fallback), so the accent is not necessarily cwal's
+        // color5 — pin the wiring to the light ranker.
+        assert_eq!(
+            s.accent,
+            pick_light_accent(&s.background, &s.colors[1..7])
         );
-        assert_eq!(s.accent, Rgb(30, 95, 19));
-        assert_eq!(s.accent, pick_accent(&s.background, &s.colors[1..7]));
     }
 
     /// Parity with cwal's own output on the same fixtures (recorded 2026-10-14
@@ -697,6 +812,18 @@ pub const LIGHT_BACKGROUND_MAX_TINT: f32 = 0.045;
 /// accent is a valid palette entry but unusable for sliders and focus rings.
 pub const MIN_ACCENT_CONTRAST: f32 = 3.0;
 
+/// Light mode lightens a picked accent down toward the background until it
+/// sits at this ratio: dark accents read as "dark theme" islands on light
+/// selections (measured in Dolphin/qBittorrent screenshots), so the fallback
+/// path lifts them as far as legibility allows instead of the 3.0 floor.
+pub const LIGHT_ACCENT_MIN_CONTRAST: f32 = 2.5;
+/// Upper bound on light-mode accent darkness when ranking candidates. The
+/// dark-mode ranker multiplies contrast by tint, so a near-black cluster wins
+/// outright on a light background (measured: `#0f070f` at 18.45:1), and
+/// selections turn into dark slabs. Anything above this roof reads as a slab,
+/// not a selection colour.
+pub const LIGHT_ACCENT_MAX_CONTRAST: f32 = 6.0;
+
 /// WCAG contrast ratio between two colors, 1.0..=21.0.
 pub(crate) fn contrast_ratio(a: &Rgb, b: &Rgb) -> f32 {
     let (la, lb) = (w3_luminance(a), w3_luminance(b));
@@ -736,6 +863,57 @@ pub fn pick_accent(background: &Rgb, accents: &[Rgb]) -> Rgb {
         }
     }
     best.unwrap_or(fallback)
+}
+
+/// Fallback for light-mode wallpapers without a candidate inside the window
+/// (see `pick_light_accent`): `lighten` is hue-preserving (every channel
+/// converges on 255 at the same rate), so relaxing toward white lifts a too
+/// dark accent while keeping as much of the wallpaper's hue as survives.
+/// Here legibility beats tint — an all-dark wallpaper has no coloured
+/// candidate to fall back to, and a washed selection bar still beats a
+/// near-black slab. Feasibility is monotone (contrast falls as the amount
+/// rises), so one binary search finds the largest amount; an accent already
+/// at or under the floor stays untouched.
+pub(crate) fn lighten_light_accent(accent: &Rgb, background: &Rgb) -> Rgb {
+    let feasible = |color: &Rgb| contrast_ratio(color, background) >= LIGHT_ACCENT_MIN_CONTRAST;
+    if !feasible(accent) {
+        return *accent;
+    }
+    let mut low = 0.0f32;
+    let mut high = 1.0f32;
+    while high - low > 0.001 {
+        let mid = (low + high) / 2.0;
+        if feasible(&lighten(accent, mid)) {
+            low = mid;
+        } else {
+            high = mid;
+        }
+    }
+    lighten(accent, low)
+}
+
+/// Light-mode accent choice. The dark-mode ranker (`pick_accent`) multiplies
+/// contrast by tint, which a near-black cluster dominates on a light
+/// background — the measured winner was `#0f070f` at 18.45:1, rendering
+/// selections as dark-theme slabs inside a light UI. Inside a legible but
+/// not-slab contrast window, the most saturated candidate is the better
+/// "selection colour". When no candidate qualifies (all-dark wallpaper), the
+/// regular winner is used and lightened toward the background instead.
+pub(crate) fn pick_light_accent(background: &Rgb, accents: &[Rgb]) -> Rgb {
+    let mut best: Option<Rgb> = None;
+    let mut best_tint = f32::NEG_INFINITY;
+    for candidate in accents {
+        let contrast = contrast_ratio(candidate, background);
+        if !(MIN_ACCENT_CONTRAST..=LIGHT_ACCENT_MAX_CONTRAST).contains(&contrast) {
+            continue;
+        }
+        let tint = rgb_to_hsv(candidate).1;
+        if tint > best_tint {
+            best_tint = tint;
+            best = Some(*candidate);
+        }
+    }
+    best.unwrap_or_else(|| lighten_light_accent(&pick_accent(background, accents), background))
 }
 
 /// Force a light-mode background to actually be light.
@@ -909,7 +1087,12 @@ pub fn generate(
         }
     }
     let foreground = colors[15];
-    let accent = pick_accent(&background, &colors[1..7]);
+    let picked = pick_accent(&background, &colors[1..7]);
+    let accent = if light {
+        pick_light_accent(&background, &colors[1..7])
+    } else {
+        picked
+    };
     Ok(Scheme {
         wallpaper: wallpaper_abs.to_string(),
         mode: mode.to_string(),

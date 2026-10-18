@@ -39,6 +39,15 @@ fn cache_dir() -> PathBuf {
         .unwrap_or_else(|_| home().join(".cache"))
 }
 
+/// Where KConfig looks for KColorScheme files (`color-schemes/` under
+/// `$XDG_DATA_HOME`). qt6ct/GTK read config-relative paths; KDE schemes are
+/// data, not config, so this is the one target that lives outside `~/.config`.
+fn data_dir() -> PathBuf {
+    env::var("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| home().join(".local/share"))
+}
+
 fn theme_conf() -> PathBuf {
     config_dir().join("coloreclipse/theme.conf")
 }
@@ -150,6 +159,152 @@ fn install_toolkit_themes(out_dir: &Path, config_root: &Path) -> Result<(), Stri
     Ok(())
 }
 
+/// Rename me: strip every `[Colors:*]` / `[ColorEffects:*]` group from an
+/// INI-shaped document (kdeglobals gives each member line of the noctalia
+/// static scheme inline, and inline groups override the scheme file
+/// `KColorScheme` loads — so leaving any of them behind re-darkens Dolphin).
+/// Sections are the unit: credit only group headers that carry no inertia
+/// elsewhere; `[General]`, `[KDE]`, `[WM]` etc. survive byte-for-byte.
+fn strip_kde_color_groups(source: &str) -> String {
+    let mut out = String::with_capacity(source.len());
+    let mut skipping = false;
+    let mut blank_pending = false;
+    for line in source.lines() {
+        if line.starts_with('[') {
+            let head = line.split(']').next().unwrap_or("").trim_start_matches('[');
+            skipping = head.starts_with("Colors:") || head.starts_with("ColorEffects:");
+            if !skipping && blank_pending {
+                // Keep exactly one separator blank line between sections,
+                // swallowing the gap a deleted group left behind.
+                if !out.is_empty() && !out.ends_with("\n\n") {
+                    out.push('\n');
+                }
+            }
+            blank_pending = false;
+        }
+        if skipping {
+            continue;
+        }
+        if line.is_empty() {
+            if blank_pending {
+                continue;
+            }
+            blank_pending = true;
+        } else {
+            blank_pending = false;
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    out
+}
+
+/// Point `[General]` at the generated scheme (the two keys KConfig reads:
+/// `ColorScheme` is the display name, `Name` the scheme id). Existing keys
+/// inside [General] are replaced in place; a missing [General] section gets
+/// one prefixed — the rest of the document survives byte-for-byte.
+fn set_scheme_name(source: &str) -> String {
+    const DISPLAY: &str = "ColorScheme=Coloreclipse";
+    const ID: &str = "Name=coloreclipse";
+    if !source.contains("[General]") {
+        return format!("[General]\n{DISPLAY}\n{ID}\n\n{source}");
+    }
+    let lines: Vec<&str> = source.lines().collect();
+    let mut out = String::with_capacity(source.len() + 64);
+    let mut i = 0;
+    while i < lines.len() {
+        if lines[i].trim() == "[General]" {
+            out.push_str(lines[i]);
+            out.push('\n');
+            // The section runs to the next header line (exclusive).
+            let end = lines[i + 1..]
+                .iter()
+                .position(|l| l.starts_with('['))
+                .map(|p| i + 1 + p)
+                .unwrap_or(lines.len());
+            for line in &lines[i + 1..end] {
+                if !line.starts_with("ColorScheme=") && !line.starts_with("Name=") {
+                    out.push_str(line);
+                    out.push('\n');
+                }
+            }
+            out.push_str(DISPLAY);
+            out.push('\n');
+            out.push_str(ID);
+            out.push('\n');
+            i = end;
+        } else {
+            out.push_str(lines[i]);
+            out.push('\n');
+            i += 1;
+        }
+    }
+    out
+}
+
+/// 
+/// KColorScheme reads the inline `[Colors:*]`/`[ColorEffects:*]` groups from
+/// kdeglobals itself (`initFromConfig`); the `.colors` file is only what the
+/// KDE settings GUI imports from, and every key missing from kdeglobals
+/// silently falls back to the built-in *light* Breeze defaults — measured as
+/// Dolphin's file view staying light in dark mode after the groups were
+/// stripped. So the generated scheme's groups (everything from its first `[`
+/// line) are appended to the stripped document.
+fn merge_scheme_groups(document: &str, scheme_body: &str) -> String {
+    let groups = scheme_body
+        .lines()
+        .skip_while(|line| !line.starts_with('['))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let mut out = document.trim_end().to_string();
+    out.push_str("\n\n");
+    out.push_str(&groups);
+    out.push('\n');
+    out
+}
+
+/// Write the generated KColorScheme under the KConfig search path
+/// (`$XDG_DATA_HOME` or `~/.local/share/color-schemes/coloreclipse.colors`)
+/// and, only if `kdeglobals` exists, rewrite it: strip the stale inline color
+/// groups, select our scheme, and write the generated groups inline (see
+/// `merge_scheme_groups` for why both halves are needed). No generated scheme
+/// in the cache means kdeglobals is left untouched — stripping without new
+/// groups would fall the app back to Breeze's light defaults.
+fn install_kde_scheme(out_dir: &Path, config_root: &Path, data_root: &Path) -> Result<(), String> {
+    let scheme_src = out_dir.join("colors-kde.colors");
+    if !scheme_src.is_file() {
+        return Ok(());
+    }
+    let body = fs::read(&scheme_src)
+        .map_err(|e| format!("Error: cannot read {}: {e}", scheme_src.display()))?;
+    let scheme_dir = data_root.join("color-schemes");
+    fs::create_dir_all(&scheme_dir)
+        .map_err(|e| format!("Error: cannot create {}: {e}", scheme_dir.display()))?;
+    let target = scheme_dir.join("coloreclipse.colors");
+    let tmp = target.with_file_name(format!(".tmp.{}.{}", std::process::id(), "coloreclipse.colors"));
+    fs::write(&tmp, &body).map_err(|e| format!("Error: cannot write {}: {e}", tmp.display()))?;
+    fs::rename(&tmp, &target)
+        .map_err(|e| format!("Error: cannot write {}: {e}", target.display()))?;
+
+    let kdeglobals = config_root.join("kdeglobals");
+    if !kdeglobals.is_file() {
+        return Ok(());
+    }
+    let source = fs::read_to_string(&kdeglobals)
+        .map_err(|e| format!("Error: cannot read {}: {e}", kdeglobals.display()))?;
+    let scheme_body = String::from_utf8_lossy(&body);
+    let rewritten = merge_scheme_groups(
+        &set_scheme_name(&strip_kde_color_groups(&source)),
+        &scheme_body,
+    );
+    let tmp = kdeglobals.with_file_name(format!(".tmp.{}.{}", std::process::id(), "kdeglobals"));
+    fs::write(&tmp, &rewritten)
+        .map_err(|e| format!("Error: cannot write {}: {e}", tmp.display()))?;
+    fs::rename(&tmp, &kdeglobals)
+        .map_err(|e| format!("Error: cannot write {}: {e}", kdeglobals.display()))?;
+    Ok(())
+}
+
 /// Run a command with its output discarded (parity with the shell scripts this
 /// replaced). False when the program is missing or exits non-zero.
 fn run(program: &str, args: &[&str]) -> bool {
@@ -207,6 +362,10 @@ fn apply_cursor(variant: &str) {
 /// is kept so it stays a drop-in component of `apply_components`.
 fn apply_gtk(variant: &str) -> bool {
     if let Err(message) = install_toolkit_themes(&wal_out_dir(), &config_dir()) {
+        eprintln!("{message}");
+        return false;
+    }
+    if let Err(message) = install_kde_scheme(&wal_out_dir(), &config_dir(), &data_dir()) {
         eprintln!("{message}");
         return false;
     }
@@ -375,6 +534,9 @@ fn run_wal(wallpaper_arg: Option<&str>) -> Result<&'static str, String> {
     render::write_all(&scheme, &wal_out_dir())
         .map_err(|_| "Error: Failed to generate color scheme".to_string())?;
     if let Err(message) = install_toolkit_themes(&wal_out_dir(), &config_dir()) {
+        eprintln!("{message}");
+    }
+    if let Err(message) = install_kde_scheme(&wal_out_dir(), &config_dir(), &data_dir()) {
         eprintln!("{message}");
     }
     println!("Color scheme generated for {target} theme");
@@ -567,6 +729,101 @@ mod tests {
         // Without a cache (no wal run yet), this is a no-op, not an error.
         let _ = fs::remove_dir_all(&out);
         super::install_toolkit_themes(&out, &root.join("config")).unwrap();
+    }
+
+    /// kdeglobals still names the retired noctalia scheme with hard-coded
+    /// dark values in its inline `[Colors:*]` groups (the Dolphin dark-view
+    /// report), and inline groups *override* any scheme file KColorScheme
+    /// loads. The parser must drop exactly those groups (plus the effect
+    /// blocks) — nothing else at all — and the rewrite must select our
+    /// generated scheme while leaving unrelated keys untouched.
+    #[test]
+    fn kdeglobals_strips_color_groups_and_selects_coloreclipse() {
+        let source = "[General]\nColorScheme=Noctalia\nName=noctalia\nTerminalApplication=kitty\n\n[KDE]\ncontrast=4\n\n[ColorEffects:Disabled]\nColor=14,14,19\nColorAmount=0\n\n[Colors:Button]\nBackgroundNormal=42,41,47\nForegroundNormal=228,225,233\n\n[Colors:Header][Inactive]\nBackgroundNormal=19,19,24\n\n[WM]\nactiveBackground=52,52,64\n";
+        let stripped = super::strip_kde_color_groups(source);
+        assert_eq!(
+            stripped,
+            "[General]\nColorScheme=Noctalia\nName=noctalia\nTerminalApplication=kitty\n\n[KDE]\ncontrast=4\n\n[WM]\nactiveBackground=52,52,64\n",
+            "the no-color sections must survive byte-for-byte"
+        );
+        let rewritten = super::set_scheme_name(&stripped);
+        assert!(rewritten.contains("ColorScheme=Coloreclipse"));
+        assert!(rewritten.contains("Name=coloreclipse"));
+        assert!(rewritten.contains("TerminalApplication=kitty"));
+        assert!(!rewritten.contains("Noctalia") && !rewritten.contains("noctalia"));
+    }
+
+    /// Missing keys come out of a foreign kdeglobals too (no [General] or a
+    /// [General] without the two keys): the rewrite must not lose the file.
+    #[test]
+    fn scheme_name_rewrite_covers_missing_general_sections() {
+        let rewritten = super::set_scheme_name("[KDE]\ncontrast=4\n");
+        assert!(rewritten.contains("ColorScheme=Coloreclipse"));
+        assert!(rewritten.contains("Name=coloreclipse"));
+        assert!(rewritten.contains("[KDE]") && rewritten.contains("contrast=4"));
+        let rewritten = super::set_scheme_name("[General]\nTerminalApplication=kitty\n");
+        assert!(rewritten.contains("[General]\nTerminalApplication=kitty"));
+        assert!(rewritten.contains("ColorScheme=Coloreclipse"));
+    }
+
+    /// `coloreclipse wal/apply` must land the KDE scheme where KConfig finds
+    /// it ($XDG_DATA_HOME or ~/.local/share, color-schemes/) — and, because
+    /// KColorScheme reads the *inline* `[Colors:*]` groups from kdeglobals
+    /// (the `.colors` file is only a settings-GUI import source, and missing
+    /// keys fall back to built-in light Breeze defaults), it must copy the
+    /// generated groups into kdeglobals too, replacing the stale ones.
+    #[test]
+    fn kde_scheme_installs_and_rewrites_kdeglobals() {
+        let root = env::temp_dir().join(format!("coloreclipse-kde-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let out = root.join("cache");
+        let config = root.join("config");
+        let data = root.join("data");
+        fs::create_dir_all(&out).unwrap();
+        fs::create_dir_all(&config).unwrap();
+        fs::write(
+            config.join("kdeglobals"),
+            "[General]\nColorScheme=Noctalia\nName=noctalia\nTerminalApplication=kitty\n\n[KDE]\ncontrast=4\n\n[Colors:Button]\nBackgroundNormal=42,41,47\n",
+        )
+        .unwrap();
+        fs::write(
+            out.join("colors-kde.colors"),
+            "; Generated by coloreclipse\n[ColorEffects:Disabled]\nColor=182,182,182\n\n[Colors:View]\nBackgroundNormal=29,26,27\nForegroundNormal=209,209,209\n",
+        )
+        .unwrap();
+
+        super::install_kde_scheme(&out, &config, &data).unwrap();
+
+        let scheme = data.join("color-schemes/coloreclipse.colors");
+        assert!(fs::read_to_string(&scheme)
+            .unwrap()
+            .contains("[Colors:View]"));
+        let kg = fs::read_to_string(config.join("kdeglobals")).unwrap();
+        assert!(kg.contains("ColorScheme=Coloreclipse"));
+        assert!(kg.contains("Name=coloreclipse"));
+        assert!(kg.contains("TerminalApplication=kitty"));
+        assert!(
+            !kg.contains("BackgroundNormal=42,41,47"),
+            "stale inline groups must be replaced"
+        );
+        assert!(
+            kg.contains("[Colors:View]\nBackgroundNormal=29,26,27"),
+            "generated groups must be written inline for KColorScheme"
+        );
+
+        // No cache (no wal run yet): kdeglobals is left alone rather than
+        // left color-group-less (which would fall back to Breeze defaults).
+        let before = fs::read_to_string(config.join("kdeglobals")).unwrap();
+        let _ = fs::remove_dir_all(&out);
+        super::install_kde_scheme(&out, &config, &data).unwrap();
+        assert_eq!(fs::read_to_string(config.join("kdeglobals")).unwrap(), before);
+        // No kdeglobals on disk (never-KDE setups): only the scheme file is
+        // written, still tolerated.
+        fs::create_dir_all(&out).unwrap();
+        fs::write(out.join("colors-kde.colors"), "kde-content").unwrap();
+        let _ = fs::remove_file(config.join("kdeglobals"));
+        super::install_kde_scheme(&out, &config, &data).unwrap();
+        assert_eq!(fs::read_to_string(&scheme).unwrap(), "kde-content");
     }
 
     #[test]
