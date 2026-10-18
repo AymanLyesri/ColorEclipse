@@ -673,7 +673,7 @@ fn hsv_to_rgb(h: f32, s: f32, v: f32) -> Rgb {
 }
 
 /// cwal `w3_luminance`: WCAG relative luminance.
-fn w3_luminance(color: &Rgb) -> f32 {
+pub(crate) fn w3_luminance(color: &Rgb) -> f32 {
     let mut channels = [f32::from(color.0) / 255.0, f32::from(color.1) / 255.0, f32::from(color.2) / 255.0];
     for channel in channels.iter_mut() {
         *channel = if *channel <= 0.04045 {
@@ -698,7 +698,7 @@ pub const LIGHT_BACKGROUND_MAX_TINT: f32 = 0.045;
 pub const MIN_ACCENT_CONTRAST: f32 = 3.0;
 
 /// WCAG contrast ratio between two colors, 1.0..=21.0.
-fn contrast_ratio(a: &Rgb, b: &Rgb) -> f32 {
+pub(crate) fn contrast_ratio(a: &Rgb, b: &Rgb) -> f32 {
     let (la, lb) = (w3_luminance(a), w3_luminance(b));
     (la.max(lb) + 0.05) / (la.min(lb) + 0.05)
 }

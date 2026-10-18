@@ -110,6 +110,46 @@ fn autovariant() -> bool {
     theme_bool_at(&theme_conf(), "autovariant")
 }
 
+/// Copy the three rendered toolkit files from the cache into the config
+/// locations GTK3/GTK4/qt6ct actually read, then delete the previous static
+/// generator's leftover outputs. Missing cache files (no `wal` run yet) are a
+/// tolerated no-op, never an error: `apply` must work before any generation.
+fn install_toolkit_themes(out_dir: &Path, config_root: &Path) -> Result<(), String> {
+    let installs = [
+        ("colors-gtk3.css", "gtk-3.0/gtk.css"),
+        ("colors-gtk4.css", "gtk-4.0/gtk.css"),
+        ("colors-qt6ct.conf", "qt6ct/colors/coloreclipse.conf"),
+    ];
+    for (source, dest) in installs {
+        let src = out_dir.join(source);
+        if !src.is_file() {
+            continue;
+        }
+        let body = fs::read(&src).map_err(|e| format!("Error: cannot read {}: {e}", src.display()))?;
+        let target = config_root.join(dest);
+        if let Some(parent) = target.parent() {
+            fs::create_dir_all(parent)
+                .map_err(|e| format!("Error: cannot create {}: {e}", parent.display()))?;
+        }
+        // tmp file + atomic rename, same shape render::write_all uses.
+        let tmp = target.with_file_name(format!(
+            ".tmp.{}.{}",
+            std::process::id(),
+            target.file_name().and_then(|n| n.to_str()).unwrap_or("file")
+        ));
+        fs::write(&tmp, &body).map_err(|e| format!("Error: cannot write {}: {e}", tmp.display()))?;
+        fs::rename(&tmp, &target)
+            .map_err(|e| format!("Error: cannot write {}: {e}", target.display()))?;
+    }
+    // noctalia.css is the previous generator's output in these two slots, now
+    // replaced wholesale by our generated gtk.css. Anything else in the
+    // directories is the user's and stays untouched.
+    for dir in ["gtk-3.0", "gtk-4.0"] {
+        let _ = fs::remove_file(config_root.join(dir).join("noctalia.css"));
+    }
+    Ok(())
+}
+
 /// Run a command with its output discarded (parity with the shell scripts this
 /// replaced). False when the program is missing or exits non-zero.
 fn run(program: &str, args: &[&str]) -> bool {
@@ -158,13 +198,24 @@ fn apply_cursor(variant: &str) {
     println!("Cursor theme set to {cursor}");
 }
 
+/// GTK/Qt theming component. The static-theme era is over: the colors come
+/// from coloreclipse's rendered stylesheets and palette (installed from the
+/// cache onto the config slots the toolkits read). The gsettings theme name is
+/// parked on the toolkit's built-in "Adwaita", which only supplies widget
+/// structure — it ships in the gtk3 package, no theme package is involved.
+/// `variant` is already baked into the cached files by `wal`; this signature
+/// is kept so it stays a drop-in component of `apply_components`.
 fn apply_gtk(variant: &str) -> bool {
-    let name = format!("WhiteSur-{}", capitalize(variant));
-    if run("gsettings", &["set", "org.gnome.desktop.interface", "gtk-theme", &name]) {
-        println!("GTK theme set to {name}");
+    if let Err(message) = install_toolkit_themes(&wal_out_dir(), &config_dir()) {
+        eprintln!("{message}");
+        return false;
+    }
+    if run("gsettings", &["set", "org.gnome.desktop.interface", "gtk-theme", "Adwaita"]) {
+        let _ = variant;
+        println!("GTK/Qt toolkit themes installed from the generated palette");
         true
     } else {
-        eprintln!("Error: Failed to set GTK theme");
+        eprintln!("Error: Failed to set GTK theme name to Adwaita");
         false
     }
 }
@@ -323,6 +374,9 @@ fn run_wal(wallpaper_arg: Option<&str>) -> Result<&'static str, String> {
         .map_err(|_| "Error: Failed to generate color scheme".to_string())?;
     render::write_all(&scheme, &wal_out_dir())
         .map_err(|_| "Error: Failed to generate color scheme".to_string())?;
+    if let Err(message) = install_toolkit_themes(&wal_out_dir(), &config_dir()) {
+        eprintln!("{message}");
+    }
     println!("Color scheme generated for {target} theme");
 
     // Apply the auto-switched variant without recursing back into wal.
@@ -473,6 +527,46 @@ mod tests {
         assert_eq!(expand_home("$HOME/x.jpg"), format!("{home}/x.jpg"));
         assert_eq!(expand_home("~/x.jpg"), format!("{home}/x.jpg"));
         assert_eq!(expand_home("/abs/x.jpg"), "/abs/x.jpg");
+    }
+
+    /// `coloreclipse gtk` copies the three rendered toolkit files from the
+    /// cache into the config locations GTK3/GTK4/qt6ct read, replacing
+    /// whatever static theme files occupy those slots, and removes the
+    /// generator's previous outputs. Missing cache files (no wal run yet)
+    /// are tolerated, not an error.
+    #[test]
+    fn toolkit_themes_install_from_cache_and_remove_static_outputs() {
+        let root = env::temp_dir().join(format!("coloreclipse-toolkit-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let out = root.join("cache");
+        fs::create_dir_all(&out).unwrap();
+        fs::create_dir_all(root.join("config/gtk-3.0")).unwrap();
+        fs::create_dir_all(root.join("config/gtk-4.0")).unwrap();
+        fs::write(out.join("colors-gtk4.css"), "gtk4-content").unwrap();
+        fs::write(out.join("colors-gtk3.css"), "gtk3-content").unwrap();
+        fs::write(out.join("colors-qt6ct.conf"), "qt6ct-content").unwrap();
+        fs::write(root.join("config/gtk-3.0/noctalia.css"), "old").unwrap();
+        fs::write(root.join("config/gtk-4.0/other-theme.css"), "old").unwrap();
+
+        super::install_toolkit_themes(&out, &root.join("config")).unwrap();
+
+        assert_eq!(
+            fs::read_to_string(root.join("config/gtk-4.0/gtk.css")).unwrap(),
+            "gtk4-content"
+        );
+        assert_eq!(
+            fs::read_to_string(root.join("config/gtk-3.0/gtk.css")).unwrap(),
+            "gtk3-content"
+        );
+        assert_eq!(
+            fs::read_to_string(root.join("config/qt6ct/colors/coloreclipse.conf")).unwrap(),
+            "qt6ct-content"
+        );
+        assert!(!root.join("config/gtk-3.0/noctalia.css").exists());
+
+        // Without a cache (no wal run yet), this is a no-op, not an error.
+        let _ = fs::remove_dir_all(&out);
+        super::install_toolkit_themes(&out, &root.join("config")).unwrap();
     }
 
     #[test]
