@@ -2428,6 +2428,39 @@ GTK3's Adwaita consumes. */
 @define-color theme_insensitive_fg_color {insensitive_fg};
 @define-color borders {borders};
 @define-color link_color {accent};
+
+/* Shadowing the legacy theme_* names is not enough: GTK3's Adwaita paints
+   with literal light hexes, so re-assert the palette on the same selectors
+   (the user stylesheet loads after the theme, so ties go to us). */
+window, .background {{ color: {fg}; background-color: {bg}; }}
+window:backdrop, .background:backdrop {{ color: {fg}; background-color: {bg}; }}
+.view, iconview, .view text, iconview text, textview text \
+{{ color: {fg}; caret-color: {fg}; background-color: {bg}; }}
+.view:selected, iconview:selected, .view text:selected, textview text:selected, \
+treeview.view:selected, treeview.view:selected:focus \
+{{ color: {on_accent}; background-color: {accent}; }}
+headerbar, .titlebar:not(headerbar) {{ color: {fg}; background-image: none; border-color: {borders}; background-color: {surface}; }}
+headerbar:backdrop, .titlebar:backdrop:not(headerbar) \
+{{ color: {fg}; background-image: none; background-color: {bg}; }}
+entry, spinbutton:not(.vertical) {{ color: {fg}; border-color: {borders}; background-color: {bg}; }}
+entry:disabled, spinbutton:disabled:not(.vertical) \
+{{ color: {insensitive_fg}; background-color: {insensitive_bg}; }}
+button, .linked > button, button.text-button, button.image-button \
+{{ color: {fg}; background-image: none; background-color: {surface}; }}
+button:hover, button:active \
+{{ color: {fg}; background-image: none; background-color: {borders}; }}
+button:checked {{ color: {on_accent}; background-color: {accent}; }}
+button:disabled {{ color: {insensitive_fg}; background-color: {insensitive_bg}; }}
+menu, popover.background, .context-menu \
+{{ color: {fg}; background-color: {surface}; }}
+menuitem:hover {{ color: {on_accent}; background-color: {accent}; }}
+toolbar, .location-bar, searchbar > revealer > box, .inline-toolbar \
+{{ color: {fg}; background-image: none; background-color: {surface}; }}
+scrollbar {{ background-color: transparent; }}
+scrollbar slider {{ background-color: {borders}; }}
+treeview.view header {{ color: {fg}; background-color: {bg}; }}
+treeview.view header button \
+{{ color: {fg}; background-image: none; background-color: {bg}; }}
 "
     )
 }
@@ -2925,7 +2958,9 @@ mod tests {
 
     /// GTK3's Adwaita consumes the legacy `theme_*` directs; the stylesheet
     /// must define those *and* the libadwaita names (each file is the user
-    /// stylesheet for its GTK generation).
+    /// stylesheet for its GTK generation). Because Adwaita's rules paint
+    /// literal light hexes, the file must also re-assert the palette on
+    /// selectors when the user stylesheet loads after the theme.
     #[test]
     fn gtk3_stylesheet_defines_theme_variables() {
         let out = gtk_test("colors-gtk3.css");
@@ -2934,6 +2969,11 @@ mod tests {
         assert!(out.contains("@define-color theme_base_color #1d1a1b;\n"));
         assert!(out.contains("@define-color theme_selected_bg_color #d1d1d1;\n"));
         assert!(out.contains("@define-color window_bg_color #1d1a1b;\n"));
+        // Selector overrides that beat Adwaita's literal light colors.
+        assert!(out.contains(".view, iconview"));
+        assert!(out.contains("background-image: none;"));
+        assert!(out.contains(".titlebar:not(headerbar) { color: #d1d1d1; background-image: none;"));
+        assert!(out.contains("treeview.view:selected"));
     }
 
     /// The QPalette file qt6ct consumes: three state colors, each 22
