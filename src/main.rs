@@ -348,7 +348,9 @@ fn capitalize(word: &str) -> String {
 
 fn apply_cursor(variant: &str) {
     let cursor = format!("phinger-cursors-{variant}");
-    run("hyprctl", &["setcursor", &format!("theme_{cursor}"), CURSOR_SIZE]);
+    // phinger ships no hyprcursor theme; Hyprland's XCursor path loads the
+    // installed theme from /usr/share/icons by this name.
+    run("hyprctl", &["setcursor", &cursor, CURSOR_SIZE]);
     run("gsettings", &["set", "org.gnome.desktop.interface", "cursor-theme", &cursor]);
     println!("Cursor theme set to {cursor}");
 }
